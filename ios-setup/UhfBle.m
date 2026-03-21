@@ -1,6 +1,6 @@
 #import "UhfBle.h"
 
-// Nordic UART Service UUIDs (same as the iOS app)
+// Nordic UART Service UUIDs
 #define kServiceUUID    @"6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define kWriteUUID      @"6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 #define kNotifyUUID     @"6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -10,26 +10,41 @@
 #define EVENT_READ_RFID         @"ReadRFIDListener"
 #define EVENT_CONNECTION_STATUS @"ConnectionStatusListener"
 
-// Command bytes (rscja BLE protocol)
-#define CMD_INVENTORY_START     0x27
-#define CMD_INVENTORY_STOP      0x28
-#define CMD_READ_TAG            0x39
-#define CMD_WRITE_TAG           0x49
-#define CMD_LOCK_TAG            0x82
-#define CMD_KILL_TAG            0x65
-#define CMD_SET_POWER           0xB6
-#define CMD_SET_FREQ            0xAD
+// A5 5A command bytes (Chainway official protocol)
+// Frame format: A5 5A [LEN_H][LEN_L][CMD][data...][XOR_CRC][0D][0A]
+// LEN = total frame size = 8 + data.length
+// XOR_CRC = XOR of bytes[2..LEN-4] (i.e. LEN_H ^ LEN_L ^ CMD ^ data...)
+#define CMD_START_INVENTORY  0x82   // payload: [count_H=00][count_L=00] (infinite)
+#define CMD_STOP_INVENTORY   0x8C   // no payload
+#define CMD_GET_LAB_MESSAGE  0xE0   // no payload — device returns buffered tags
+#define CMD_READ_TAG         0x84
+#define CMD_WRITE_TAG        0x86
+#define CMD_LOCK_TAG         0x88
+#define CMD_KILL_TAG         0x8A
+#define CMD_SET_POWER        0x10
+#define CMD_SET_REGION       0x2C   // payload: [save=0x01][region_byte]
+                                    // region: 0x01=China1 0x02=China2 0x04=EU
+                                    //         0x08=FCC/US 0x16=Korea 0x32=Japan
+
+// Response cmd bytes
+#define RESP_INVENTORY_BATCH 0xE1   // batch tag data in response to CMD_GET_LAB_MESSAGE
+#define RESP_READ_TAG        0x85
+#define RESP_WRITE_TAG       0x87
+#define RESP_LOCK_TAG        0x89
+#define RESP_KILL_TAG        0x8B
+#define RESP_SET_POWER       0x11
+#define RESP_SET_REGION      0x2D
 
 typedef NS_ENUM(NSInteger, PendingOperation) {
     OperationNone = 0,
     OperationRead,
     OperationWrite,
+    OperationErase,
     OperationLock,
     OperationKill,
-    OperationErase,
+    OperationSingleInventory,
     OperationSetPower,
     OperationSetFrequency,
-    OperationConnect,
 };
 
 @interface UhfBle ()
@@ -44,7 +59,17 @@ typedef NS_ENUM(NSInteger, PendingOperation) {
 
 @property (nonatomic, assign) BOOL isInventorying;
 @property (nonatomic, assign) BOOL hasListeners;
+@property (nonatomic, assign) BOOL pendingScan;
 @property (nonatomic, copy)   NSString *filterEpc;
+
+// 50 ms poll timer — fires CMD_GET_LAB_MESSAGE while inventorying
+@property (nonatomic, strong) NSTimer *pollTimer;
+
+// L2CAP CoC (iOS 11+, faster than GATT NUS when device supports it)
+@property (nonatomic, strong) id        l2capChannel;       // CBL2CAPChannel*
+@property (nonatomic, strong) NSMutableData *l2capRxBuffer;
+@property (nonatomic, assign) BOOL      usingL2CAP;
+@property (nonatomic, assign) uint16_t  l2capPSM;
 
 // Pending promise callbacks
 @property (nonatomic, copy) RCTPromiseResolveBlock pendingResolve;
@@ -72,6 +97,7 @@ RCT_EXPORT_MODULE()
         _receiveBuffer         = [NSMutableData data];
         _isInventorying        = NO;
         _hasListeners          = NO;
+        _pendingScan           = NO;
         _pendingOp             = OperationNone;
         dispatch_queue_t queue = dispatch_queue_create("com.uhfble.ble", DISPATCH_QUEUE_SERIAL);
         _centralManager = [[CBCentralManager alloc] initWithDelegate:self queue:queue];
@@ -91,10 +117,15 @@ RCT_EXPORT_MODULE()
 // ─── BLE Scan ────────────────────────────────────────────────────────────────
 
 RCT_EXPORT_METHOD(scanBLE) {
+    NSLog(@"[UhfBle] scanBLE called, state=%ld hasListeners=%d", (long)self.centralManager.state, self.hasListeners);
     [self.discoveredPeripherals removeAllObjects];
     [self.discoveredAddresses removeAllObjects];
     if (self.centralManager.state == CBManagerStatePoweredOn) {
         [self.centralManager scanForPeripheralsWithServices:nil options:nil];
+        NSLog(@"[UhfBle] Scan started");
+    } else {
+        self.pendingScan = YES;
+        NSLog(@"[UhfBle] BT not ready, queued scan");
     }
 }
 
@@ -123,7 +154,6 @@ RCT_EXPORT_METHOD(connectAddress:(NSString *)address
         [self.centralManager stopScan];
         [self.centralManager connectPeripheral:target options:nil];
     } else {
-        // Try connecting by UUID directly
         NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:address];
         if (uuid) {
             NSArray *known = [self.centralManager retrievePeripheralsWithIdentifiers:@[uuid]];
@@ -162,21 +192,35 @@ RCT_EXPORT_METHOD(getConnectionStatus:(RCTPromiseResolveBlock)resolve
 RCT_EXPORT_METHOD(startInventory) {
     if (self.isInventorying) return;
     self.filterEpc = nil;
+    [self.tagBuffer removeAllObjects];
     self.isInventorying = YES;
     [self sendCommand:[self buildStartInventoryCommand]];
+    [self startPollTimer];
 }
 
 RCT_EXPORT_METHOD(startInventoryWithFilter:(NSString *)epc) {
     if (self.isInventorying) return;
     self.filterEpc = epc;
+    [self.tagBuffer removeAllObjects];
     self.isInventorying = YES;
     [self sendCommand:[self buildStartInventoryCommand]];
+    [self startPollTimer];
 }
 
 RCT_EXPORT_METHOD(stopInventory) {
     self.isInventorying = NO;
     self.filterEpc = nil;
+    [self stopPollTimer];
     [self sendCommand:[self buildStopInventoryCommand]];
+}
+
+RCT_EXPORT_METHOD(inventorySingleTag:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    if (![self assertConnected:reject]) return;
+    [self setPendingOp:OperationSingleInventory resolve:resolve reject:reject];
+    self.isInventorying = YES;
+    [self sendCommand:[self buildStartInventoryCommand]];
+    [self startPollTimer];
 }
 
 RCT_EXPORT_METHOD(clearData:(RCTPromiseResolveBlock)resolve
@@ -249,27 +293,6 @@ RCT_EXPORT_METHOD(killTag:(NSDictionary *)params
     [self sendCommand:cmd];
 }
 
-// ─── Erase Tag ───────────────────────────────────────────────────────────────
-
-RCT_EXPORT_METHOD(eraseTag:(NSDictionary *)params
-                  resolver:(RCTPromiseResolveBlock)resolve
-                  rejecter:(RCTPromiseRejectBlock)reject) {
-    if (![self assertConnected:reject]) return;
-    [self setPendingOp:OperationErase resolve:resolve reject:reject];
-
-    int bank   = [params[@"bank"] intValue];
-    int ptr    = [params[@"ptr"]  intValue];
-    int len    = [params[@"len"]  intValue];
-    NSString *pwd = params[@"password"] ?: @"00000000";
-
-    // Write zeros
-    NSMutableString *zeros = [NSMutableString string];
-    for (int i = 0; i < len * 4; i++) [zeros appendString:@"0"];
-
-    NSData *cmd = [self buildWriteCommand:bank ptr:ptr len:len password:pwd data:zeros];
-    [self sendCommand:cmd];
-}
-
 // ─── Settings ────────────────────────────────────────────────────────────────
 
 RCT_EXPORT_METHOD(setPower:(int)power
@@ -280,6 +303,29 @@ RCT_EXPORT_METHOD(setPower:(int)power
     [self sendCommand:[self buildSetPowerCommand:power]];
 }
 
+// ─── Erase Tag ────────────────────────────────────────────────────────────────
+
+RCT_EXPORT_METHOD(eraseTag:(NSDictionary *)params
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    if (![self assertConnected:reject]) return;
+    [self setPendingOp:OperationErase resolve:resolve reject:reject];
+
+    int bank      = [params[@"bank"] intValue];
+    int ptr       = [params[@"ptr"]  intValue];
+    int len       = [params[@"len"]  intValue];
+    NSString *pwd = params[@"password"] ?: @"00000000";
+
+    // Erase = write zeros (len words = len*4 hex chars of zeros)
+    NSMutableString *zeros = [NSMutableString string];
+    for (int i = 0; i < len * 4; i++) [zeros appendString:@"0"];
+
+    NSData *cmd = [self buildWriteCommand:bank ptr:ptr len:len password:pwd data:zeros];
+    [self sendCommand:cmd];
+}
+
+// ─── Set Frequency ────────────────────────────────────────────────────────────
+
 RCT_EXPORT_METHOD(setFrequency:(int)mode
                   resolver:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject) {
@@ -288,48 +334,85 @@ RCT_EXPORT_METHOD(setFrequency:(int)mode
     [self sendCommand:[self buildSetFrequencyCommand:mode]];
 }
 
-// Required stubs for RN event emitter
-RCT_EXPORT_METHOD(addListener:(NSString *)eventName) {}
-RCT_EXPORT_METHOD(removeListeners:(int)count) {}
+// ─── Poll timer ──────────────────────────────────────────────────────────────
+
+- (void)startPollTimer {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // Invalidate inline — do NOT call stopPollTimer here, which would
+        // dispatch another async block that would kill the timer we're about to create.
+        [self.pollTimer invalidate];
+        self.pollTimer = nil;
+        self.pollTimer = [NSTimer scheduledTimerWithTimeInterval:0.05
+                                                          target:self
+                                                        selector:@selector(pollTagData)
+                                                        userInfo:nil
+                                                         repeats:YES];
+    });
+}
+
+- (void)stopPollTimer {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self.pollTimer invalidate];
+        self.pollTimer = nil;
+    });
+}
+
+- (void)pollTagData {
+    // Called on main thread by NSTimer
+    if (self.isInventorying) {
+        [self sendCommand:[self buildGetLabMessageCommand]];
+    } else {
+        // Directly invalidate — we ARE on main thread already
+        [self.pollTimer invalidate];
+        self.pollTimer = nil;
+    }
+}
 
 // ─── CBCentralManagerDelegate ────────────────────────────────────────────────
 
 - (void)centralManagerDidUpdateState:(CBCentralManager *)central {
-    // Bluetooth state changed — no action needed here
+    NSLog(@"[UhfBle] centralManagerDidUpdateState: %ld", (long)central.state);
+    if (central.state == CBManagerStatePoweredOn && self.pendingScan) {
+        self.pendingScan = NO;
+        [self.centralManager scanForPeripheralsWithServices:nil options:nil];
+        NSLog(@"[UhfBle] Started pending scan");
+    }
 }
 
 - (void)centralManager:(CBCentralManager *)central
  didDiscoverPeripheral:(CBPeripheral *)peripheral
      advertisementData:(NSDictionary<NSString *,id> *)advertisementData
                   RSSI:(NSNumber *)RSSI {
-    if (!peripheral.name || peripheral.name.length == 0) return;
     NSString *uuidStr = peripheral.identifier.UUIDString;
     if ([self.discoveredAddresses containsObject:uuidStr]) return;
 
     [self.discoveredAddresses addObject:uuidStr];
     [self.discoveredPeripherals addObject:peripheral];
 
-    if (self.hasListeners) {
-        [self sendEventWithName:EVENT_SCAN_BLE body:@{
-            @"name_device":    peripheral.name ?: @"",
-            @"address_device": uuidStr,
-            @"rssi":           RSSI.stringValue,
-        }];
-    }
+    NSString *name = peripheral.name
+        ?: advertisementData[CBAdvertisementDataLocalNameKey]
+        ?: @"Unknown";
+
+    NSLog(@"[UhfBle] Discovered: %@ (%@)", name, uuidStr);
+
+    [self sendEventWithName:EVENT_SCAN_BLE body:@{
+        @"name_device":    name,
+        @"address_device": uuidStr,
+        @"rssi":           RSSI.stringValue,
+    }];
 }
 
 - (void)centralManager:(CBCentralManager *)central
   didConnectPeripheral:(CBPeripheral *)peripheral {
     self.connectedPeripheral = peripheral;
     peripheral.delegate = self;
-    [peripheral discoverServices:@[[CBUUID UUIDWithString:kServiceUUID]]];
+    // Discover all services — lets us find L2CAP PSM characteristic if device supports it
+    [peripheral discoverServices:nil];
 
-    if (self.hasListeners) {
-        [self sendEventWithName:EVENT_CONNECTION_STATUS body:@{
-            @"status": @"connected",
-            @"device": peripheral.name ?: @"",
-        }];
-    }
+    [self sendEventWithName:EVENT_CONNECTION_STATUS body:@{
+        @"status": @"connected",
+        @"device": peripheral.name ?: @"",
+    }];
 }
 
 - (void)centralManager:(CBCentralManager *)central
@@ -340,20 +423,27 @@ didFailToConnectPeripheral:(CBPeripheral *)peripheral
         self.connectResolve = nil;
         self.connectReject  = nil;
     }
-    if (self.hasListeners) {
-        [self sendEventWithName:EVENT_CONNECTION_STATUS body:@{ @"status": @"disconnected" }];
-    }
+    [self sendEventWithName:EVENT_CONNECTION_STATUS body:@{ @"status": @"disconnected" }];
 }
 
 - (void)centralManager:(CBCentralManager *)central
 didDisconnectPeripheral:(CBPeripheral *)peripheral
                  error:(NSError *)error {
-    self.connectedPeripheral   = nil;
-    self.writeCharacteristic   = nil;
-    self.isInventorying        = NO;
-    if (self.hasListeners) {
-        [self sendEventWithName:EVENT_CONNECTION_STATUS body:@{ @"status": @"disconnected" }];
+    [self stopPollTimer];
+    self.isInventorying = NO;
+
+    if (@available(iOS 11.0, *)) {
+        if (self.l2capChannel) {
+            CBL2CAPChannel *ch = (CBL2CAPChannel *)self.l2capChannel;
+            [ch.inputStream close];
+            [ch.outputStream close];
+        }
     }
+    self.l2capChannel        = nil;
+    self.usingL2CAP          = NO;
+    self.connectedPeripheral = nil;
+    self.writeCharacteristic = nil;
+    [self sendEventWithName:EVENT_CONNECTION_STATUS body:@{ @"status": @"disconnected" }];
 }
 
 // ─── CBPeripheralDelegate ────────────────────────────────────────────────────
@@ -361,12 +451,7 @@ didDisconnectPeripheral:(CBPeripheral *)peripheral
 - (void)peripheral:(CBPeripheral *)peripheral
 didDiscoverServices:(NSError *)error {
     for (CBService *service in peripheral.services) {
-        if ([service.UUID isEqual:[CBUUID UUIDWithString:kServiceUUID]]) {
-            [peripheral discoverCharacteristics:@[
-                [CBUUID UUIDWithString:kWriteUUID],
-                [CBUUID UUIDWithString:kNotifyUUID],
-            ] forService:service];
-        }
+        [peripheral discoverCharacteristics:nil forService:service];
     }
 }
 
@@ -375,13 +460,21 @@ didDiscoverCharacteristicsForService:(CBService *)service
              error:(NSError *)error {
     for (CBCharacteristic *c in service.characteristics) {
         if ([c.UUID isEqual:[CBUUID UUIDWithString:kWriteUUID]]) {
-            self.writeCharacteristic = c;
+            if (c.properties & CBCharacteristicPropertyWriteWithoutResponse) {
+                self.writeCharacteristic = c;
+            }
         }
         if ([c.UUID isEqual:[CBUUID UUIDWithString:kNotifyUUID]]) {
             [peripheral setNotifyValue:YES forCharacteristic:c];
         }
+        if (@available(iOS 11.0, *)) {
+            if ([c.UUID.UUIDString.uppercaseString isEqualToString:
+                     [CBUUIDL2CAPPSMCharacteristicString uppercaseString]]) {
+                NSLog(@"[UhfBle] Found L2CAP PSM characteristic — reading");
+                [peripheral readValueForCharacteristic:c];
+            }
+        }
     }
-    // Resolve connect promise once characteristics are ready
     if (self.writeCharacteristic && self.connectResolve) {
         NSString *name = peripheral.name ?: peripheral.identifier.UUIDString;
         self.connectResolve(name);
@@ -394,223 +487,391 @@ didDiscoverCharacteristicsForService:(CBService *)service
 didUpdateValueForCharacteristic:(CBCharacteristic *)characteristic
              error:(NSError *)error {
     if (error || !characteristic.value) return;
-    [self processReceivedData:characteristic.value];
+
+    if (@available(iOS 11.0, *)) {
+        if ([characteristic.UUID.UUIDString.uppercaseString isEqualToString:
+                 [CBUUIDL2CAPPSMCharacteristicString uppercaseString]]) {
+            if (characteristic.value.length >= 2) {
+                uint16_t psm = 0;
+                [characteristic.value getBytes:&psm length:sizeof(psm)];
+                psm = CFSwapInt16LittleToHost(psm);
+                self.l2capPSM = psm;
+                NSLog(@"[UhfBle] L2CAP PSM = %u — opening channel", psm);
+                [peripheral openL2CAPChannel:psm];
+            }
+            return;
+        }
+    }
+
+    // NUS notify data — only process via GATT path if not on L2CAP
+    if (!self.usingL2CAP) {
+        [self processReceivedData:characteristic.value];
+    }
+}
+
+// ─── CBPeripheralDelegate — L2CAP ────────────────────────────────────────────
+
+- (void)peripheral:(CBPeripheral *)peripheral
+didOpenL2CAPChannel:(id)channel
+              error:(NSError *)error API_AVAILABLE(ios(11.0)) {
+    if (error || !channel) {
+        NSLog(@"[UhfBle] L2CAP open failed (%@) — staying on GATT", error.localizedDescription);
+        return;
+    }
+    CBL2CAPChannel *ch = (CBL2CAPChannel *)channel;
+    self.l2capChannel   = ch;
+    self.usingL2CAP     = YES;
+    self.l2capRxBuffer  = [NSMutableData data];
+
+    ch.inputStream.delegate = self;
+    [ch.inputStream scheduleInRunLoop:[NSRunLoop mainRunLoop] forMode:NSDefaultRunLoopMode];
+    [ch.inputStream open];
+    [ch.outputStream open];
+    NSLog(@"[UhfBle] L2CAP channel open, PSM=%u — all I/O now via L2CAP", ch.PSM);
+}
+
+// ─── NSStreamDelegate ────────────────────────────────────────────────────────
+
+- (void)stream:(NSStream *)aStream handleEvent:(NSStreamEvent)eventCode {
+    if (@available(iOS 11.0, *)) {
+        switch (eventCode) {
+            case NSStreamEventHasBytesAvailable: {
+                uint8_t buf[512];
+                NSInteger n = [(NSInputStream *)aStream read:buf maxLength:sizeof(buf)];
+                if (n > 0) {
+                    [self processReceivedData:[NSData dataWithBytes:buf length:n]];
+                }
+                break;
+            }
+            case NSStreamEventEndEncountered:
+            case NSStreamEventErrorOccurred: {
+                NSLog(@"[UhfBle] L2CAP stream ended/error — falling back to GATT");
+                self.usingL2CAP  = NO;
+                self.l2capChannel = nil;
+                break;
+            }
+            default:
+                break;
+        }
+    }
 }
 
 // ─── Command builders ────────────────────────────────────────────────────────
+//
+// A5 5A frame format:
+//   A5 5A [LEN_H][LEN_L][CMD][data...][XOR_CRC][0D][0A]
+//
+// LEN     = 8 + data.length  (total frame size)
+// XOR_CRC = XOR(LEN_H, LEN_L, CMD, data[0], data[1], ...)
 
-/// All commands follow the rscja BLE frame format:
-/// BB <len_hi> <len_lo> <cmd> [data...] <checksum> 7E
-///
-/// Checksum = sum of all bytes between BB and checksum (exclusive), masked to 0xFF
+- (NSData *)buildA55AFrame:(uint8_t)cmd data:(NSData *)data {
+    NSUInteger dataLen = data ? data.length : 0;
+    uint16_t totalLen  = (uint16_t)(8 + dataLen);
+    uint8_t lenH = (totalLen >> 8) & 0xFF;
+    uint8_t lenL = totalLen & 0xFF;
 
-- (NSData *)buildFrame:(uint8_t)cmd payload:(NSData *)payload {
-    NSMutableData *frame = [NSMutableData data];
-    uint8_t header = 0xBB;
-    [frame appendBytes:&header length:1];
-    uint16_t payloadLen = (uint16_t)(payload ? payload.length : 0);
-    uint8_t lenHi = (payloadLen >> 8) & 0xFF;
-    uint8_t lenLo = payloadLen & 0xFF;
-    [frame appendBytes:&lenHi length:1];
-    [frame appendBytes:&lenLo length:1];
-    [frame appendBytes:&cmd   length:1];
-    if (payload) [frame appendData:payload];
-
-    // Checksum: sum of len_hi + len_lo + cmd + payload bytes
-    uint8_t checksum = lenHi + lenLo + cmd;
-    if (payload) {
-        const uint8_t *bytes = payload.bytes;
-        for (NSUInteger i = 0; i < payload.length; i++) checksum += bytes[i];
+    // XOR checksum over bytes[2..LEN-4]: LEN_H, LEN_L, CMD, data bytes
+    uint8_t xorCrc = lenH ^ lenL ^ cmd;
+    if (data) {
+        const uint8_t *db = data.bytes;
+        for (NSUInteger i = 0; i < dataLen; i++) xorCrc ^= db[i];
     }
-    checksum &= 0xFF;
-    [frame appendBytes:&checksum length:1];
-    uint8_t tail = 0x7E;
-    [frame appendBytes:&tail length:1];
+
+    NSMutableData *frame = [NSMutableData dataWithCapacity:totalLen];
+    uint8_t header[2] = { 0xA5, 0x5A };
+    [frame appendBytes:header length:2];
+    [frame appendBytes:&lenH length:1];
+    [frame appendBytes:&lenL length:1];
+    [frame appendBytes:&cmd  length:1];
+    if (data) [frame appendData:data];
+    [frame appendBytes:&xorCrc length:1];
+    uint8_t tail[2] = { 0x0D, 0x0A };
+    [frame appendBytes:tail length:2];
     return frame;
 }
 
 - (NSData *)buildStartInventoryCommand {
-    return [self buildFrame:CMD_INVENTORY_START payload:nil];
+    // cmd=0x82, payload=[00 00] (count=0 means infinite)
+    uint8_t payload[2] = { 0x00, 0x00 };
+    return [self buildA55AFrame:CMD_START_INVENTORY
+                           data:[NSData dataWithBytes:payload length:2]];
 }
 
 - (NSData *)buildStopInventoryCommand {
-    return [self buildFrame:CMD_INVENTORY_STOP payload:nil];
+    return [self buildA55AFrame:CMD_STOP_INVENTORY data:nil];
+}
+
+- (NSData *)buildGetLabMessageCommand {
+    return [self buildA55AFrame:CMD_GET_LAB_MESSAGE data:nil];
 }
 
 - (NSData *)buildReadCommand:(int)bank ptr:(int)ptr len:(int)len password:(NSString *)pwd {
-    NSMutableData *payload = [NSMutableData data];
-    // password (4 bytes)
-    NSData *pwdBytes = [self hexStringToData:pwd];
-    [payload appendData:pwdBytes];
-    // bank (1 byte), ptr (2 bytes), len (1 byte)
-    uint8_t b = bank & 0xFF;
-    uint16_t p = htons((uint16_t)ptr);
-    uint8_t l = len & 0xFF;
-    [payload appendBytes:&b length:1];
-    [payload appendBytes:&p length:2];
-    [payload appendBytes:&l length:1];
-    return [self buildFrame:CMD_READ_TAG payload:payload];
+    // data = [pwd:4][MMB=0][MSA_H=0][MSA_L=0][MDL_H=0][MDL_L=0][MB][SA_H][SA_L][DL_H][DL_L]
+    NSMutableData *payload = [NSMutableData dataWithCapacity:14];
+    [payload appendData:[self hexStringToData:pwd]];   // 4 bytes password
+    uint8_t zeros5[5] = { 0, 0, 0, 0, 0 };            // MMB + MSA(2) + MDL(2) — no mask filter
+    [payload appendBytes:zeros5 length:5];
+    uint8_t  mb   = bank & 0xFF;
+    uint8_t  saH  = (ptr >> 8) & 0xFF;
+    uint8_t  saL  = ptr & 0xFF;
+    uint8_t  dlH  = (len >> 8) & 0xFF;
+    uint8_t  dlL  = len & 0xFF;
+    uint8_t  addr[5] = { mb, saH, saL, dlH, dlL };
+    [payload appendBytes:addr length:5];
+    return [self buildA55AFrame:CMD_READ_TAG data:payload];
 }
 
 - (NSData *)buildWriteCommand:(int)bank ptr:(int)ptr len:(int)len password:(NSString *)pwd data:(NSString *)data {
     NSMutableData *payload = [NSMutableData data];
-    NSData *pwdBytes  = [self hexStringToData:pwd];
-    NSData *dataBytes = [self hexStringToData:data];
-    [payload appendData:pwdBytes];
-    uint8_t b = bank & 0xFF;
-    uint16_t p = htons((uint16_t)ptr);
-    uint8_t l = len & 0xFF;
-    [payload appendBytes:&b length:1];
-    [payload appendBytes:&p length:2];
-    [payload appendBytes:&l length:1];
-    [payload appendData:dataBytes];
-    return [self buildFrame:CMD_WRITE_TAG payload:payload];
+    [payload appendData:[self hexStringToData:pwd]];   // 4 bytes password
+    uint8_t zeros5[5] = { 0, 0, 0, 0, 0 };
+    [payload appendBytes:zeros5 length:5];
+    uint8_t mb   = bank & 0xFF;
+    uint8_t saH  = (ptr >> 8) & 0xFF;
+    uint8_t saL  = ptr & 0xFF;
+    uint8_t dlH  = (len >> 8) & 0xFF;
+    uint8_t dlL  = len & 0xFF;
+    uint8_t addr[5] = { mb, saH, saL, dlH, dlL };
+    [payload appendBytes:addr length:5];
+    [payload appendData:[self hexStringToData:data]];  // write data
+    return [self buildA55AFrame:CMD_WRITE_TAG data:payload];
 }
 
 - (NSData *)buildLockCommand:(NSString *)pwd lockCode:(NSString *)lockCode {
+    // data = [pwd:4][MMB=0][MSA_H=0][MSA_L=0][MDL_H=0][MDL_L=0][lockData:3]
     NSMutableData *payload = [NSMutableData data];
-    [payload appendData:[self hexStringToData:pwd]];
-    [payload appendData:[self hexStringToData:lockCode]];
-    return [self buildFrame:CMD_LOCK_TAG payload:payload];
+    [payload appendData:[self hexStringToData:pwd]];   // 4 bytes password
+    uint8_t zeros5[5] = { 0, 0, 0, 0, 0 };
+    [payload appendBytes:zeros5 length:5];
+    [payload appendData:[self hexStringToData:lockCode]]; // 3 bytes lock code
+    return [self buildA55AFrame:CMD_LOCK_TAG data:payload];
 }
 
 - (NSData *)buildKillCommand:(NSString *)pwd {
-    NSData *payload = [self hexStringToData:pwd];
-    return [self buildFrame:CMD_KILL_TAG payload:payload];
+    // data = [killPwd:4][MMB=0][MSA_H=0][MSA_L=0][MDL_H=0][MDL_L=0]
+    NSMutableData *payload = [NSMutableData data];
+    [payload appendData:[self hexStringToData:pwd]];   // 4 bytes kill password
+    uint8_t zeros5[5] = { 0, 0, 0, 0, 0 };
+    [payload appendBytes:zeros5 length:5];
+    return [self buildA55AFrame:CMD_KILL_TAG data:payload];
 }
 
 - (NSData *)buildSetPowerCommand:(int)power {
-    NSMutableData *payload = [NSMutableData data];
-    // power as 2 bytes
-    uint16_t p = htons((uint16_t)(power * 100));
-    [payload appendBytes:&p length:2];
-    return [self buildFrame:CMD_SET_POWER payload:payload];
+    // data = [0x02][antenna=0x00][readPower*100 BE:2][writePower*100 BE:2]
+    NSMutableData *payload = [NSMutableData dataWithCapacity:6];
+    uint16_t powerRaw = (uint16_t)(power * 100);
+    uint8_t  powerH   = (powerRaw >> 8) & 0xFF;
+    uint8_t  powerL   = powerRaw & 0xFF;
+    uint8_t  bytes[6] = { 0x02, 0x00, powerH, powerL, powerH, powerL };
+    [payload appendBytes:bytes length:6];
+    return [self buildA55AFrame:CMD_SET_POWER data:payload];
 }
 
 - (NSData *)buildSetFrequencyCommand:(int)mode {
-    NSMutableData *payload = [NSMutableData data];
-    uint8_t m = mode & 0xFF;
-    [payload appendBytes:&m length:1];
-    return [self buildFrame:CMD_SET_FREQ payload:payload];
+    // data = [save=0x01][region_byte]
+    // mode/region: 0x01=China1 0x02=China2 0x04=EU 0x08=FCC/US 0x16=Korea 0x32=Japan
+    uint8_t bytes[2] = { 0x01, (uint8_t)(mode & 0xFF) };
+    return [self buildA55AFrame:CMD_SET_REGION
+                           data:[NSData dataWithBytes:bytes length:2]];
 }
 
 // ─── Response parser ─────────────────────────────────────────────────────────
+//
+// Device frame format: A5 5A [LEN_H][LEN_L][CMD][data...][XOR_CRC][0D][0A]
+// Parse using LENGTH field — no need to search for terminator
 
-- (void)processReceivedData:(NSData *)data {
-    [self.receiveBuffer appendData:data];
+- (void)processReceivedData:(NSData *)incoming {
+    [self.receiveBuffer appendData:incoming];
 
-    // Look for complete frames (0xBB ... 0x7E)
-    while (self.receiveBuffer.length >= 5) {
+    while (self.receiveBuffer.length >= 8) { // minimum valid frame size
         const uint8_t *bytes = self.receiveBuffer.bytes;
-        if (bytes[0] != 0xBB) {
-            // Discard until next 0xBB
+
+        // Sync to A5 5A preamble
+        if (bytes[0] != 0xA5) {
             NSUInteger skip = 1;
-            while (skip < self.receiveBuffer.length && bytes[skip] != 0xBB) skip++;
+            while (skip < self.receiveBuffer.length && bytes[skip] != 0xA5) skip++;
             [self.receiveBuffer replaceBytesInRange:NSMakeRange(0, skip) withBytes:NULL length:0];
             continue;
         }
-        if (self.receiveBuffer.length < 5) break;
-        uint16_t payloadLen = (bytes[1] << 8) | bytes[2];
-        NSUInteger frameLen = 4 + payloadLen + 1 + 1; // BB + len(2) + cmd + payload + checksum + 7E
-        if (self.receiveBuffer.length < frameLen) break;
-        if (bytes[frameLen - 1] != 0x7E) {
+        if (bytes[1] != 0x5A) {
             [self.receiveBuffer replaceBytesInRange:NSMakeRange(0, 1) withBytes:NULL length:0];
             continue;
         }
-        uint8_t cmd    = bytes[3];
-        NSData *payload = [self.receiveBuffer subdataWithRange:NSMakeRange(4, payloadLen)];
-        [self.receiveBuffer replaceBytesInRange:NSMakeRange(0, frameLen) withBytes:NULL length:0];
-        [self handleResponse:cmd payload:payload];
+
+        // Need LEN field
+        if (self.receiveBuffer.length < 4) break;
+
+        uint16_t totalLen = ((uint16_t)bytes[2] << 8) | bytes[3];
+        if (totalLen < 8) {
+            // Invalid frame length — skip this A5 and retry
+            [self.receiveBuffer replaceBytesInRange:NSMakeRange(0, 2) withBytes:NULL length:0];
+            continue;
+        }
+
+        // Wait until we have the complete frame
+        if (self.receiveBuffer.length < totalLen) break;
+
+        uint8_t   cmd     = bytes[4];
+        NSUInteger dataLen = totalLen - 8; // exclude A5 5A LEN_H LEN_L CMD XOR 0D 0A
+        NSData    *payload = (dataLen > 0)
+            ? [self.receiveBuffer subdataWithRange:NSMakeRange(5, dataLen)]
+            : [NSData data];
+
+        [self.receiveBuffer replaceBytesInRange:NSMakeRange(0, totalLen) withBytes:NULL length:0];
+
+        [self processCmd:cmd payload:payload];
     }
 }
 
-- (void)handleResponse:(uint8_t)cmd payload:(NSData *)payload {
-    const uint8_t *bytes = payload.bytes;
-    BOOL success = (payload.length > 0 && bytes[0] == 0x00);
+- (void)processCmd:(uint8_t)cmd payload:(NSData *)payload {
+    NSLog(@"[UhfBle] cmd=0x%02X payloadLen=%lu", cmd, (unsigned long)payload.length);
 
     switch (cmd) {
-        case CMD_INVENTORY_START: {
-            // Inventory data response: parse EPC from payload
-            if (!self.isInventorying) break;
-            if (payload.length < 4) break;
-            // EPC starts at byte 2, length = payload[1] / 8 * 2 chars (in bytes)
-            NSUInteger epcLen = bytes[1] / 8;
-            if (payload.length < 2 + epcLen) break;
-            NSData *epcData = [payload subdataWithRange:NSMakeRange(2, epcLen)];
-            NSString *epc   = [self dataToHexString:epcData];
-            if ([self.tagBuffer containsObject:epc]) break;
-            if (self.filterEpc && self.filterEpc.length > 0 && ![self.filterEpc isEqualToString:epc]) break;
-            [self.tagBuffer addObject:epc];
-            if (self.hasListeners) {
-                [self sendEventWithName:EVENT_READ_RFID body:@{
-                    @"rfid_tag": epc,
-                    @"rssi":     @"",
-                }];
+        case RESP_INVENTORY_BATCH:
+            if (self.isInventorying) {
+                [self parseInventoryBatch:payload];
             }
+            break;
+
+        case RESP_READ_TAG: {
+            if (self.pendingOp != OperationRead) break;
+            const uint8_t *b = payload.bytes;
+            // payload[0] = status, payload[1..] = data words
+            if (payload.length >= 1 && b[0] == 0x00 && payload.length > 1) {
+                NSData *readData = [payload subdataWithRange:NSMakeRange(1, payload.length - 1)];
+                NSString *hex = [self dataToHexString:readData];
+                if (self.pendingResolve) self.pendingResolve(hex);
+            } else {
+                if (self.pendingReject) self.pendingReject(@"READ_FAIL", @"Read tag failed", nil);
+            }
+            [self clearPending];
             break;
         }
-        case CMD_READ_TAG:
-            if (self.pendingOp == OperationRead || self.pendingOp == OperationErase) {
-                if (success && self.pendingResolve) {
-                    // Data starts at byte 1
-                    NSData *readData = [payload subdataWithRange:NSMakeRange(1, payload.length - 1)];
-                    self.pendingResolve([self dataToHexString:readData]);
-                } else if (self.pendingReject) {
-                    self.pendingReject(@"READ_FAIL", @"Read tag failed", nil);
-                }
-                [self clearPending];
-            }
+
+        case RESP_WRITE_TAG:    // also handles erase (which is a write of zeros)
+        case RESP_LOCK_TAG:
+        case RESP_KILL_TAG:
+        case RESP_SET_POWER:
+        case RESP_SET_REGION: {
+            if (self.pendingOp == OperationNone) break;
+            const uint8_t *b = payload.bytes;
+            BOOL ok = (payload.length >= 1 && b[0] == 0x00);
+            if (ok && self.pendingResolve) self.pendingResolve(@YES);
+            else if (!ok && self.pendingReject) self.pendingReject(@"OP_FAIL", @"Operation failed", nil);
+            [self clearPending];
             break;
-        case CMD_WRITE_TAG:
-            if (self.pendingOp == OperationWrite || self.pendingOp == OperationErase) {
-                if (success && self.pendingResolve) self.pendingResolve(@YES);
-                else if (self.pendingReject) self.pendingReject(@"WRITE_FAIL", @"Write tag failed", nil);
-                [self clearPending];
-            }
-            break;
-        case CMD_LOCK_TAG:
-            if (self.pendingOp == OperationLock) {
-                if (success && self.pendingResolve) self.pendingResolve(@YES);
-                else if (self.pendingReject) self.pendingReject(@"LOCK_FAIL", @"Lock tag failed", nil);
-                [self clearPending];
-            }
-            break;
-        case CMD_KILL_TAG:
-            if (self.pendingOp == OperationKill) {
-                if (success && self.pendingResolve) self.pendingResolve(@YES);
-                else if (self.pendingReject) self.pendingReject(@"KILL_FAIL", @"Kill tag failed", nil);
-                [self clearPending];
-            }
-            break;
-        case CMD_SET_POWER:
-            if (self.pendingOp == OperationSetPower) {
-                if (self.pendingResolve) self.pendingResolve(@(success));
-                [self clearPending];
-            }
-            break;
-        case CMD_SET_FREQ:
-            if (self.pendingOp == OperationSetFrequency) {
-                if (self.pendingResolve) self.pendingResolve(@(success));
-                [self clearPending];
-            }
-            break;
+        }
+
         default:
+            // ACK frames (e.g. 0x83 for start, 0x8D for stop) — ignored
             break;
+    }
+}
+
+// ─── Inventory batch parser ───────────────────────────────────────────────────
+//
+// cmd=0xE1 payload: [idx_H][idx_L][count][len1][tag1_data...][len2][tag2_data...]...
+// tag_data = [PC:2][EPC:N][RSSI:2]
+//   epcByteCount = (PC[0] >> 3) * 2
+//   rssi_dBm     = -(65535 - uint16(rssiBytes)) / 10.0
+
+- (void)parseInventoryBatch:(NSData *)payload {
+    if (payload.length < 3) return;
+    const uint8_t *bytes = payload.bytes;
+    NSUInteger count  = bytes[2]; // number of tags in this batch
+    NSUInteger offset = 3;
+
+    for (NSUInteger i = 0; i < count; i++) {
+        if (offset >= payload.length) break;
+        NSUInteger tagLen = bytes[offset++];
+        if (offset + tagLen > payload.length) break;
+
+        // tag_data = [PC:2][EPC:N][RSSI:2]
+        if (tagLen < 4) { offset += tagLen; continue; } // need PC(2) + at least RSSI(2)
+
+        uint8_t    pc0          = bytes[offset];
+        NSUInteger epcByteCount = ((pc0 >> 3) & 0x1F) * 2;
+
+        if (2 + epcByteCount + 2 > tagLen) { offset += tagLen; continue; } // sanity
+
+        NSData   *epcData = [payload subdataWithRange:NSMakeRange(offset + 2, epcByteCount)];
+        NSString *epc     = [[self dataToHexString:epcData] uppercaseString];
+
+        uint16_t rssiRaw = ((uint16_t)bytes[offset + tagLen - 2] << 8)
+                         |  (uint16_t)bytes[offset + tagLen - 1];
+        double   rssiDbm = -(65535.0 - rssiRaw) / 10.0;
+        NSString *rssiStr = [NSString stringWithFormat:@"%.1f", rssiDbm];
+
+        offset += tagLen;
+
+        if (epc.length == 0) continue;
+
+        NSLog(@"[UhfBle] tag EPC=%@ RSSI=%@", epc, rssiStr);
+
+        if (self.pendingOp == OperationSingleInventory) {
+            self.isInventorying = NO;
+            [self stopPollTimer];
+            [self sendCommand:[self buildStopInventoryCommand]];
+            if (self.pendingResolve) self.pendingResolve(@{ @"rfid_tag": epc, @"rssi": rssiStr });
+            [self clearPending];
+            return;
+        }
+
+        if (self.filterEpc && self.filterEpc.length > 0 &&
+            ![self.filterEpc.uppercaseString isEqualToString:epc]) continue;
+        if ([self.tagBuffer containsObject:epc]) continue;
+
+        [self.tagBuffer addObject:epc];
+        [self sendEventWithName:EVENT_READ_RFID body:@{ @"rfid_tag": epc, @"rssi": rssiStr }];
     }
 }
 
 // ─── BLE write helper ────────────────────────────────────────────────────────
 
 - (void)sendCommand:(NSData *)data {
-    if (!self.connectedPeripheral || !self.writeCharacteristic) return;
-    NSUInteger maxLen = 20; // BLE MTU typical max
+    if (!self.connectedPeripheral) {
+        NSLog(@"[UhfBle] sendCommand: not connected");
+        return;
+    }
+    NSMutableString *hex = [NSMutableString string];
+    const uint8_t *bytes = data.bytes;
+    for (NSUInteger i = 0; i < data.length; i++) [hex appendFormat:@"%02X ", bytes[i]];
+    NSLog(@"[UhfBle] sendCommand (%@): %@", self.usingL2CAP ? @"L2CAP" : @"GATT", hex);
+
+    // ── L2CAP path ────────────────────────────────────────────────────────────
+    if (@available(iOS 11.0, *)) {
+        if (self.usingL2CAP && self.l2capChannel) {
+            CBL2CAPChannel *ch = (CBL2CAPChannel *)self.l2capChannel;
+            NSOutputStream *out = ch.outputStream;
+            NSUInteger offset = 0;
+            while (offset < data.length) {
+                if (!out.hasSpaceAvailable) {
+                    usleep(1000);
+                    continue;
+                }
+                NSInteger written = [out write:(bytes + offset) maxLength:(data.length - offset)];
+                if (written <= 0) break;
+                offset += written;
+            }
+            return;
+        }
+    }
+
+    // ── GATT NUS path (fallback) ──────────────────────────────────────────────
+    if (!self.writeCharacteristic) {
+        NSLog(@"[UhfBle] sendCommand: no write characteristic");
+        return;
+    }
+    NSUInteger maxLen = [self.connectedPeripheral
+                            maximumWriteValueLengthForType:CBCharacteristicWriteWithoutResponse];
     NSUInteger offset = 0;
     while (offset < data.length) {
         NSUInteger chunkLen = MIN(maxLen, data.length - offset);
         NSData *chunk = [data subdataWithRange:NSMakeRange(offset, chunkLen)];
         [self.connectedPeripheral writeValue:chunk
                            forCharacteristic:self.writeCharacteristic
-                                        type:CBCharacteristicWriteWithResponse];
+                                        type:CBCharacteristicWriteWithoutResponse];
+        if (data.length > maxLen) usleep(1000 * 30);
         offset += chunkLen;
     }
 }

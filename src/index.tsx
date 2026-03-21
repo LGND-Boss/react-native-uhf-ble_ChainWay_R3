@@ -135,6 +135,14 @@ export function stopInventory(): void {
   return UhfBleNative.stopInventory();
 }
 
+/**
+ * Start inventory, return the first tag found, then stop automatically.
+ * iOS only — on Android use startInventory + onTagRead + stopInventory manually.
+ */
+export function inventorySingleTag(): Promise<{ rfid_tag: string; rssi: string }> {
+  return UhfBleNative.inventorySingleTag();
+}
+
 /** Clear the internal tag list. */
 export function clearData(): Promise<boolean> {
   return UhfBleNative.clearData();
