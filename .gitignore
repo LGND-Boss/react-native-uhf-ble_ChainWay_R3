@@ -1,0 +1,14 @@
+node_modules/
+lib/
+.DS_Store
+*.log
+android/build/
+ios/build/
+example/node_modules/
+example/android/build/
+example/ios/build/
+example/ios/Pods/
+.gradle/
+*.iml
+.idea/
+local.properties

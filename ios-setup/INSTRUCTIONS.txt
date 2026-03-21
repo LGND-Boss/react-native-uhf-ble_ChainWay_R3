@@ -1,0 +1,76 @@
+╔══════════════════════════════════════════════════════════════╗
+║           UHF BLE App — iOS / Xcode Setup Guide              ║
+╚══════════════════════════════════════════════════════════════╝
+
+PREREQUISITES (on your Mac)
+────────────────────────────
+1. Xcode 14 or later (from App Store)
+2. Node.js 18+  →  https://nodejs.org
+3. CocoaPods    →  run: sudo gem install cocoapods
+4. Watchman     →  run: brew install watchman
+
+
+STEPS
+──────
+1. Copy this entire "ios-setup" folder to your Mac.
+
+2. Open Terminal in that folder and run:
+     chmod +x setup.sh
+     ./setup.sh
+
+   This will:
+   - Create a React Native 0.72 project called "UhfBleApp"
+   - Copy all source files in
+   - Run npm install
+   - Run pod install
+
+3. Open in Xcode:
+     open UhfBleApp/ios/UhfBleApp.xcworkspace
+
+4. In Xcode:
+   - Select your iPhone/iPad as the target device
+   - Press Cmd+R to build and run
+
+5. Add Bluetooth permission strings to Info.plist:
+   (Xcode will prompt you, or add manually)
+
+   Key: NSBluetoothAlwaysUsageDescription
+   Value: "This app uses Bluetooth to connect to the UHF RFID reader"
+
+   Key: NSBluetoothPeripheralUsageDescription
+   Value: "This app uses Bluetooth to connect to the UHF RFID reader"
+
+
+WHAT'S IN THIS FOLDER
+───────────────────────
+  setup.sh          - Automated setup script
+  App.tsx           - Main React Native app (4 tabs)
+  index.js          - App entry point
+  UhfBle.h          - iOS native module header
+  UhfBle.m          - iOS native module (CoreBluetooth)
+  Podfile.template  - iOS dependencies
+
+
+NATIVE MODULE OVERVIEW (UhfBle.m)
+───────────────────────────────────
+  BLE Service UUID : 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
+  Write UUID       : 6E400002-B5A3-F393-E0A9-E50E24DCCA9E
+  Notify UUID      : 6E400003-B5A3-F393-E0A9-E50E24DCCA9E
+
+  (Nordic UART Service — same as the original iOS ObjC app)
+
+
+UNIQUE RFID COUNTING
+──────────────────────
+  Each EPC is emitted EXACTLY once per inventory session.
+  - Native layer: uses a HashSet/NSMutableArray check
+  - JS layer: secondary dedup as safety net
+  Call clearData() to reset the seen-tag list.
+
+
+TROUBLESHOOTING
+────────────────
+  "pod install fails"    → run: sudo gem update cocoapods
+  "Build error on M1"    → Rosetta may be needed:
+                           Xcode > Product > Destination > "My Mac (Rosetta)"
+  "Bluetooth not working" → Check Info.plist has both BT keys above
