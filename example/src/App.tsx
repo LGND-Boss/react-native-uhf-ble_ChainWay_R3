@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import {
   SafeAreaView,
   View,
@@ -9,12 +9,16 @@ import {
   StyleSheet,
   Alert,
   ScrollView,
+  StatusBar,
+  ActivityIndicator,
+  Platform,
 } from 'react-native';
 import {
   scanBLE,
   stopScanBLE,
   connectAddress,
   disconnect,
+  getConnectionStatus,
   startInventory,
   startInventoryWithFilter,
   stopInventory,
@@ -24,6 +28,7 @@ import {
   lockTag,
   killTag,
   setPower,
+  getPower,
   UhfBleEmitter,
   SCAN_BLE_EVENT,
   READ_RFID_EVENT,
@@ -32,294 +37,572 @@ import {
   type RFIDTag,
 } from 'react-native-uhf-ble';
 
+// ─── Theme ────────────────────────────────────────────────────────────────────
+
+const C = {
+  primary:   '#1a73e8',
+  success:   '#1e8c45',
+  warning:   '#e37400',
+  danger:    '#d93025',
+  purple:    '#7b2d9e',
+  bg:        '#f1f3f4',
+  card:      '#ffffff',
+  border:    '#dadce0',
+  text:      '#202124',
+  subtext:   '#5f6368',
+};
+
 type Tab = 'scan' | 'inventory' | 'readwrite' | 'operations';
 
+// ─── App ──────────────────────────────────────────────────────────────────────
+
 export default function App() {
-  const [tab, setTab] = useState<Tab>('scan');
-  const [connectionStatus, setConnectionStatus] = useState('disconnected');
-  const [connectedDevice, setConnectedDevice] = useState('');
+  const [tab, setTab]               = useState<Tab>('scan');
+  const [connStatus, setConnStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
+  const [connDevice, setConnDevice] = useState('');
   const [bleDevices, setBleDevices] = useState<BLEDevice[]>([]);
-  const [rfidTags, setRfidTags] = useState<RFIDTag[]>([]);
+  const [isScanning, setIsScanning] = useState(false);
+  const [rfidTags, setRfidTags]     = useState<RFIDTag[]>([]);
+  const [isInventorying, setInventory] = useState(false);
+  const pendingTags = useRef<RFIDTag[]>([]);
+  const flushTimer  = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // ReadWrite state
+  // R/W
   const [rwBank, setRwBank] = useState('1');
-  const [rwPtr, setRwPtr] = useState('2');
-  const [rwLen, setRwLen] = useState('6');
-  const [rwPwd, setRwPwd] = useState('00000000');
+  const [rwPtr,  setRwPtr]  = useState('2');
+  const [rwLen,  setRwLen]  = useState('6');
+  const [rwPwd,  setRwPwd]  = useState('00000000');
   const [rwData, setRwData] = useState('');
+  const [rwBusy, setRwBusy] = useState(false);
 
-  // Operations state
-  const [opPwd, setOpPwd] = useState('00000000');
-  const [lockCode, setLockCode] = useState('000000');
-  const [powerValue, setPowerValue] = useState('20');
+  // Operations
+  const [opPwd,       setOpPwd]      = useState('00000000');
+  const [lockCode,    setLockCode]   = useState('000000');
+  const [power,       setPowerVal]   = useState('20');
+  const [devicePower, setDevicePower] = useState<number | null>(null);
+  const [opBusy,      setOpBusy]     = useState(false);
 
-  // Filter for inventory
+  // EPC filter
   const [filterEpc, setFilterEpc] = useState('');
 
   useEffect(() => {
-    const scanSub = UhfBleEmitter.addListener(SCAN_BLE_EVENT, (device: BLEDevice) => {
-      setBleDevices(prev => {
-        if (prev.find(d => d.address_device === device.address_device)) return prev;
-        return [...prev, device].sort((a, b) => parseInt(b.rssi) - parseInt(a.rssi));
-      });
+    const s1 = UhfBleEmitter.addListener(SCAN_BLE_EVENT, (d: BLEDevice) => {
+      setBleDevices(prev =>
+        prev.find(x => x.address_device === d.address_device)
+          ? prev
+          : [...prev, d].sort((a, b) => parseInt(b.rssi) - parseInt(a.rssi))
+      );
     });
-    const rfidSub = UhfBleEmitter.addListener(READ_RFID_EVENT, (tag: RFIDTag) => {
-      setRfidTags(prev => {
-        if (prev.find(t => t.rfid_tag === tag.rfid_tag)) return prev;
-        return [...prev, tag];
-      });
+    const s2 = UhfBleEmitter.addListener(READ_RFID_EVENT, (tag: RFIDTag) => {
+      pendingTags.current.push(tag);
+      if (!flushTimer.current) {
+        flushTimer.current = setTimeout(() => {
+          flushTimer.current = null;
+          const batch = pendingTags.current.splice(0);
+          if (!batch.length) return;
+          setRfidTags(prev => {
+            const fresh = batch.filter(t => !prev.find(p => p.rfid_tag === t.rfid_tag));
+            return fresh.length ? [...prev, ...fresh] : prev;
+          });
+        }, 0);
+      }
     });
-    const connSub = UhfBleEmitter.addListener(CONNECTION_STATUS_EVENT, (e: any) => {
-      setConnectionStatus(e.status);
-      if (e.device) setConnectedDevice(e.device);
-      else if (e.status === 'disconnected') setConnectedDevice('');
+    const s3 = UhfBleEmitter.addListener(CONNECTION_STATUS_EVENT, (e: any) => {
+      setConnStatus(e.status);
+      if (e.device) setConnDevice(e.device);
+      else if (e.status === 'disconnected') { setConnDevice(''); setInventory(false); }
     });
-    return () => {
-      scanSub.remove();
-      rfidSub.remove();
-      connSub.remove();
-    };
+    return () => { s1.remove(); s2.remove(); s3.remove(); };
   }, []);
 
-  const handleConnect = useCallback(async (address: string) => {
+  const handleConnect = useCallback(async (addr: string) => {
     try {
       stopScanBLE();
-      setConnectionStatus('connecting');
-      const result = await connectAddress(address);
-      setConnectedDevice(result);
+      setIsScanning(false);
+      setConnStatus('connecting');
+      const name = await connectAddress(addr);
+      setConnDevice(name);
     } catch (e: any) {
-      Alert.alert('Connect Error', e.message);
+      setConnStatus('disconnected');
+      Alert.alert('Connect Failed', e.message);
     }
   }, []);
 
+  const handleScan = () => {
+    setBleDevices([]);
+    setIsScanning(true);
+    scanBLE();
+  };
+  const handleStopScan = () => {
+    setIsScanning(false);
+    stopScanBLE();
+  };
+
+  const handleStartInventory = () => {
+    setRfidTags([]);
+    pendingTags.current = [];
+    if (flushTimer.current) { clearTimeout(flushTimer.current); flushTimer.current = null; }
+    setInventory(true);
+    filterEpc ? startInventoryWithFilter(filterEpc) : startInventory();
+  };
+  const handleStopInventory = () => {
+    setInventory(false);
+    stopInventory();
+  };
+  const handleClearTags = async () => {
+    await clearData();
+    setRfidTags([]);
+  };
+
   const handleRead = useCallback(async () => {
+    setRwBusy(true);
     try {
       const data = await readTag({
-        bank: parseInt(rwBank),
-        ptr: parseInt(rwPtr),
-        len: parseInt(rwLen),
-        password: rwPwd,
+        bank: parseInt(rwBank), ptr: parseInt(rwPtr),
+        len: parseInt(rwLen), password: rwPwd,
       });
       setRwData(data);
-      Alert.alert('Read Success', data);
+      Alert.alert('Read OK', data);
     } catch (e: any) {
       Alert.alert('Read Failed', e.message);
-    }
+    } finally { setRwBusy(false); }
   }, [rwBank, rwPtr, rwLen, rwPwd]);
 
   const handleWrite = useCallback(async () => {
-    if (!rwData) { Alert.alert('Error', 'Enter data to write'); return; }
+    if (!rwData.trim()) { Alert.alert('Error', 'Enter hex data to write'); return; }
+    setRwBusy(true);
     try {
       await writeTag({
-        bank: parseInt(rwBank),
-        ptr: parseInt(rwPtr),
-        len: parseInt(rwLen),
-        data: rwData,
-        password: rwPwd,
+        bank: parseInt(rwBank), ptr: parseInt(rwPtr),
+        len: parseInt(rwLen), data: rwData, password: rwPwd,
       });
-      Alert.alert('Write Success');
+      Alert.alert('Write OK', 'Tag written successfully.');
     } catch (e: any) {
       Alert.alert('Write Failed', e.message);
-    }
+    } finally { setRwBusy(false); }
   }, [rwBank, rwPtr, rwLen, rwData, rwPwd]);
 
   const handleLock = useCallback(async () => {
+    setOpBusy(true);
     try {
       await lockTag({ password: opPwd, lockCode });
-      Alert.alert('Lock Success');
+      Alert.alert('Lock OK', 'Tag locked successfully.');
     } catch (e: any) {
       Alert.alert('Lock Failed', e.message);
-    }
+    } finally { setOpBusy(false); }
   }, [opPwd, lockCode]);
 
   const handleKill = useCallback(async () => {
     Alert.alert('Kill Tag', 'This permanently disables the tag. Continue?', [
       { text: 'Cancel', style: 'cancel' },
-      {
-        text: 'Kill', style: 'destructive', onPress: async () => {
-          try {
-            await killTag({ password: opPwd });
-            Alert.alert('Kill Success');
-          } catch (e: any) {
-            Alert.alert('Kill Failed', e.message);
-          }
-        }
-      }
+      { text: 'Kill', style: 'destructive', onPress: async () => {
+        setOpBusy(true);
+        try {
+          await killTag({ password: opPwd });
+          Alert.alert('Kill OK', 'Tag has been permanently disabled.');
+        } catch (e: any) {
+          Alert.alert('Kill Failed', e.message);
+        } finally { setOpBusy(false); }
+      }},
     ]);
   }, [opPwd]);
 
-  const handleSetPower = useCallback(async () => {
+  const handleSetPower = async () => {
+    setOpBusy(true);
     try {
-      await setPower(parseInt(powerValue));
-      Alert.alert('Power Set', `Power set to ${powerValue} dBm`);
+      await setPower(parseInt(power));
+      Alert.alert('Power Set', `Output power set to ${power} dBm.`);
     } catch (e: any) {
-      Alert.alert('Set Power Failed', e.message);
-    }
-  }, [powerValue]);
+      Alert.alert('Error', e.message);
+    } finally { setOpBusy(false); }
+  };
 
-  const statusColor = connectionStatus === 'connected' ? '#27ae60'
-    : connectionStatus === 'connecting' ? '#f39c12' : '#e74c3c';
+  const handleGetPower = async () => {
+    setOpBusy(true);
+    try {
+      const p = await getPower();
+      setDevicePower(p);
+    } catch (e: any) {
+      Alert.alert('Error', e.message);
+    } finally { setOpBusy(false); }
+  };
+
+  const statusColor = connStatus === 'connected' ? C.success
+    : connStatus === 'connecting' ? C.warning : C.danger;
 
   return (
-    <SafeAreaView style={styles.container}>
-      {/* Status bar */}
-      <View style={[styles.statusBar, { backgroundColor: statusColor }]}>
-        <Text style={styles.statusText}>
-          {connectionStatus.toUpperCase()}
-          {connectedDevice ? ` — ${connectedDevice}` : ''}
-        </Text>
-        {connectionStatus === 'connected' && (
-          <TouchableOpacity onPress={disconnect}>
-            <Text style={styles.disconnectBtn}>Disconnect</Text>
+    <SafeAreaView style={styles.root}>
+      <StatusBar backgroundColor={statusColor} barStyle="light-content" />
+
+      {/* ── Header ── */}
+      <View style={[styles.header, { backgroundColor: statusColor }]}>
+        <View>
+          <Text style={styles.headerTitle}>UHF BLE Reader</Text>
+          <View style={styles.statusRow}>
+            <View style={[styles.dot, { backgroundColor: connStatus === 'connected' ? '#a8e6bf' : '#fff' }]} />
+            <Text style={styles.headerSub}>
+              {connStatus === 'connected'
+                ? connDevice || 'Connected'
+                : connStatus === 'connecting'
+                ? 'Connecting\u2026'
+                : 'Not connected'}
+            </Text>
+          </View>
+        </View>
+        {connStatus === 'connected' && (
+          <TouchableOpacity style={styles.disconnectBtn} onPress={disconnect}>
+            <Text style={styles.disconnectTxt}>Disconnect</Text>
           </TouchableOpacity>
+        )}
+        {connStatus === 'connecting' && (
+          <ActivityIndicator color="#fff" style={{ marginRight: 4 }} />
         )}
       </View>
 
-      {/* Tabs */}
-      <View style={styles.tabs}>
+      {/* ── Tab bar ── */}
+      <View style={styles.tabBar}>
         {(['scan', 'inventory', 'readwrite', 'operations'] as Tab[]).map(t => (
-          <TouchableOpacity key={t} style={[styles.tab, tab === t && styles.tabActive]} onPress={() => setTab(t)}>
-            <Text style={[styles.tabText, tab === t && styles.tabTextActive]}>
-              {t === 'readwrite' ? 'R/W' : t.charAt(0).toUpperCase() + t.slice(1)}
+          <TouchableOpacity key={t} style={[styles.tab, tab === t && styles.tabActive]}
+            onPress={() => setTab(t)}>
+            <Text style={[styles.tabLabel, tab === t && { color: C.primary, fontWeight: '700' }]}>
+              {t === 'readwrite' ? 'R/W' : t[0].toUpperCase() + t.slice(1)}
             </Text>
           </TouchableOpacity>
         ))}
       </View>
 
-      {/* ── SCAN TAB ── */}
+      {/* ── SCAN ── */}
       {tab === 'scan' && (
         <View style={styles.panel}>
-          <View style={styles.row}>
-            <Btn title="Scan BLE" color="#2980b9" onPress={() => { setBleDevices([]); scanBLE(); }} />
-            <Btn title="Stop Scan" color="#7f8c8d" onPress={stopScanBLE} />
+          <View style={styles.actionRow}>
+            {!isScanning
+              ? <PrimaryBtn title="Scan BLE" color={C.primary} onPress={handleScan} />
+              : <PrimaryBtn title="Stop Scan" color={C.subtext} onPress={handleStopScan} />
+            }
+            {isScanning && <ActivityIndicator color={C.primary} style={{ marginLeft: 12 }} />}
           </View>
-          <Text style={styles.sectionLabel}>Devices ({bleDevices.length})</Text>
+          <SectionHeader
+            title={`Devices found: ${bleDevices.length}`}
+            hint="Tap a device to connect"
+          />
           <FlatList
             data={bleDevices}
-            keyExtractor={item => item.address_device}
+            keyExtractor={i => i.address_device}
+            contentContainerStyle={{ paddingBottom: 16 }}
+            ListEmptyComponent={
+              <EmptyState
+                message={isScanning ? 'Scanning for devices\u2026' : 'Tap "Scan BLE" to discover devices.'}
+              />
+            }
             renderItem={({ item }) => (
-              <TouchableOpacity style={styles.listItem} onPress={() => handleConnect(item.address_device)}>
-                <Text style={styles.listItemTitle}>{item.name_device || 'Unknown'}</Text>
-                <Text style={styles.listItemSub}>{item.address_device}  RSSI: {item.rssi}</Text>
+              <TouchableOpacity
+                style={[styles.card, connStatus === 'connected' && connDevice === item.name_device && styles.cardActive]}
+                onPress={() => handleConnect(item.address_device)}
+                activeOpacity={0.7}
+              >
+                <View style={styles.cardRow}>
+                  <View style={styles.cardIcon}>
+                    <Text style={styles.cardIconTxt}>BT</Text>
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.cardTitle}>{item.name_device || 'Unknown Device'}</Text>
+                    <Text style={styles.cardSub} numberOfLines={1}>{item.address_device}</Text>
+                  </View>
+                  <View style={[styles.rssiBadge, { backgroundColor: rssiColor(item.rssi) }]}>
+                    <Text style={styles.rssiBadgeTxt}>{item.rssi} dBm</Text>
+                  </View>
+                </View>
               </TouchableOpacity>
             )}
           />
         </View>
       )}
 
-      {/* ── INVENTORY TAB ── */}
+      {/* ── INVENTORY ── */}
       {tab === 'inventory' && (
         <View style={styles.panel}>
           <TextInput
             style={styles.input}
             placeholder="Filter by EPC (optional)"
+            placeholderTextColor={C.subtext}
             value={filterEpc}
             onChangeText={setFilterEpc}
+            autoCapitalize="characters"
+            autoCorrect={false}
           />
-          <View style={styles.row}>
-            <Btn title="Start" color="#27ae60"
-              onPress={() => filterEpc ? startInventoryWithFilter(filterEpc) : startInventory()} />
-            <Btn title="Stop" color="#e74c3c" onPress={stopInventory} />
-            <Btn title="Clear" color="#7f8c8d"
-              onPress={() => clearData().then(() => setRfidTags([]))} />
+          <View style={styles.actionRow}>
+            {!isInventorying
+              ? <PrimaryBtn title="Start Inventory" color={C.success} onPress={handleStartInventory} />
+              : <PrimaryBtn title="Stop" color={C.danger} onPress={handleStopInventory} />
+            }
+            <OutlineBtn title="Clear" onPress={handleClearTags} />
+            {isInventorying && <ActivityIndicator color={C.success} style={{ marginLeft: 8 }} />}
           </View>
-          <Text style={styles.sectionLabel}>Tags ({rfidTags.length})</Text>
+          <SectionHeader
+            title={`Tags: ${rfidTags.length}`}
+            hint="Each EPC counted once per session"
+          />
           <FlatList
             data={rfidTags}
-            keyExtractor={(item, i) => `${item.rfid_tag}-${i}`}
+            keyExtractor={(_, i) => String(i)}
+            contentContainerStyle={{ paddingBottom: 16 }}
+            ListEmptyComponent={
+              <EmptyState
+                message={isInventorying ? 'Scanning for tags\u2026' : 'Press "Start Inventory" to read tags.'}
+              />
+            }
             renderItem={({ item, index }) => (
-              <View style={styles.listItem}>
-                <Text style={styles.listItemTitle}>{index + 1}. {item.rfid_tag}</Text>
-                {item.rssi ? <Text style={styles.listItemSub}>RSSI: {item.rssi}</Text> : null}
+              <View style={styles.card}>
+                <View style={styles.cardRow}>
+                  <View style={[styles.cardIndex, { backgroundColor: C.primary }]}>
+                    <Text style={styles.cardIndexTxt}>{index + 1}</Text>
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.cardTitle}>{item.rfid_tag}</Text>
+                    {item.rssi ? (
+                      <Text style={styles.cardSub}>RSSI {item.rssi} dBm</Text>
+                    ) : null}
+                  </View>
+                </View>
               </View>
             )}
           />
         </View>
       )}
 
-      {/* ── READ/WRITE TAB ── */}
+      {/* ── READ / WRITE ── */}
       {tab === 'readwrite' && (
-        <ScrollView style={styles.panel}>
-          <Text style={styles.sectionLabel}>Memory Bank</Text>
-          <View style={styles.row}>
-            {[['RESERVED', '0'], ['EPC', '1'], ['TID', '2'], ['USER', '3']].map(([label, val]) => (
-              <TouchableOpacity key={val} style={[styles.chip, rwBank === val && styles.chipActive]}
-                onPress={() => setRwBank(val)}>
-                <Text style={[styles.chipText, rwBank === val && styles.chipTextActive]}>{label}</Text>
+        <ScrollView style={styles.panel} keyboardShouldPersistTaps="handled">
+          <FieldLabel>Memory Bank</FieldLabel>
+          <View style={styles.chipRow}>
+            {([['RSVD', '0'], ['EPC', '1'], ['TID', '2'], ['USER', '3']] as const).map(([l, v]) => (
+              <TouchableOpacity key={v} style={[styles.chip, rwBank === v && styles.chipActive]}
+                onPress={() => setRwBank(v)}>
+                <Text style={[styles.chipTxt, rwBank === v && styles.chipTxtActive]}>{l}</Text>
               </TouchableOpacity>
             ))}
           </View>
-          <Field label="Address (ptr)" value={rwPtr} onChangeText={setRwPtr} keyboardType="numeric" />
-          <Field label="Length (words)" value={rwLen} onChangeText={setRwLen} keyboardType="numeric" />
-          <Field label="Access Password" value={rwPwd} onChangeText={setRwPwd} />
-          <Field label="Data (hex)" value={rwData} onChangeText={setRwData} />
-          <View style={styles.row}>
-            <Btn title="Read" color="#2980b9" onPress={handleRead} />
-            <Btn title="Write" color="#e67e22" onPress={handleWrite} />
+          <InputField label="Address (word ptr)" value={rwPtr} onChange={setRwPtr} numeric />
+          <InputField label="Length (words)" value={rwLen} onChange={setRwLen} numeric />
+          <InputField label="Access Password (hex)" value={rwPwd} onChange={setRwPwd} mono />
+          <InputField label="Data (hex)" value={rwData} onChange={setRwData} mono
+            hint="Leave empty to read; fill to write" />
+          <View style={styles.actionRow}>
+            <PrimaryBtn title={rwBusy ? '\u2026' : 'Read Tag'} color={C.primary}
+              onPress={handleRead} disabled={rwBusy} />
+            <PrimaryBtn title={rwBusy ? '\u2026' : 'Write Tag'} color={C.warning}
+              onPress={handleWrite} disabled={rwBusy || !rwData.trim()} />
           </View>
         </ScrollView>
       )}
 
-      {/* ── OPERATIONS TAB ── */}
+      {/* ── OPERATIONS ── */}
       {tab === 'operations' && (
-        <ScrollView style={styles.panel}>
-          <Field label="Access / Kill Password" value={opPwd} onChangeText={setOpPwd} />
-          <Field label="Lock Code (hex, 3 bytes)" value={lockCode} onChangeText={setLockCode} />
-          <View style={styles.row}>
-            <Btn title="Lock Tag" color="#8e44ad" onPress={handleLock} />
-            <Btn title="Kill Tag" color="#c0392b" onPress={handleKill} />
+        <ScrollView style={styles.panel} keyboardShouldPersistTaps="handled">
+          <InputField label="Access / Kill Password (hex)" value={opPwd} onChange={setOpPwd} mono />
+          <InputField label="Lock Code (3 bytes hex)" value={lockCode} onChange={setLockCode} mono
+            hint="Encodes per-bank lock bits. 000000 = no change." />
+          <View style={styles.actionRow}>
+            <PrimaryBtn title={opBusy ? '\u2026' : 'Lock Tag'} color={C.purple}
+              onPress={handleLock} disabled={opBusy} />
+            <PrimaryBtn title={opBusy ? '\u2026' : 'Kill Tag'} color={C.danger}
+              onPress={handleKill} disabled={opBusy} />
           </View>
-          <View style={styles.divider} />
-          <Field label="Power (dBm, 5–30)" value={powerValue} onChangeText={setPowerValue} keyboardType="numeric" />
-          <Btn title="Set Power" color="#16a085" onPress={handleSetPower} />
+
+          <Divider />
+
+          <InputField label="RF Power (dBm, 5\u201330)" value={power} onChange={setPowerVal} numeric />
+          <View style={styles.actionRow}>
+            <PrimaryBtn title={opBusy ? '\u2026' : `Set Power (${power} dBm)`} color={C.success}
+              onPress={handleSetPower} disabled={opBusy} />
+            <OutlineBtn title="Read from Device" onPress={handleGetPower} />
+          </View>
+          {devicePower !== null && (
+            <View style={styles.powerReadout}>
+              <Text style={styles.powerReadoutLabel}>Current device power</Text>
+              <Text style={styles.powerReadoutValue}>{devicePower} dBm</Text>
+            </View>
+          )}
+
+          <View style={styles.warningBox}>
+            <Text style={styles.warningTitle}>Kill is irreversible</Text>
+            <Text style={styles.warningBody}>
+              Killing a tag permanently disables it. Ensure you have the correct kill password
+              before proceeding.
+            </Text>
+          </View>
         </ScrollView>
       )}
     </SafeAreaView>
   );
 }
 
-function Btn({ title, color, onPress }: { title: string; color: string; onPress: () => void }) {
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function rssiColor(rssi: string): string {
+  const v = parseInt(rssi);
+  if (v >= -60) return '#1e8c45';
+  if (v >= -75) return '#e37400';
+  return '#d93025';
+}
+
+// ─── Sub-components ───────────────────────────────────────────────────────────
+
+function PrimaryBtn({ title, color, onPress, disabled }: {
+  title: string; color: string; onPress: () => void; disabled?: boolean;
+}) {
   return (
-    <TouchableOpacity style={[styles.btn, { backgroundColor: color }]} onPress={onPress}>
-      <Text style={styles.btnText}>{title}</Text>
+    <TouchableOpacity
+      style={[styles.btn, { backgroundColor: disabled ? '#b0b0b0' : color }]}
+      onPress={onPress}
+      disabled={disabled}
+      activeOpacity={0.8}
+    >
+      <Text style={styles.btnTxt}>{title}</Text>
     </TouchableOpacity>
   );
 }
 
-function Field({ label, value, onChangeText, keyboardType }: any) {
+function OutlineBtn({ title, onPress }: { title: string; onPress: () => void }) {
   return (
-    <View style={styles.fieldWrap}>
-      <Text style={styles.fieldLabel}>{label}</Text>
-      <TextInput style={styles.input} value={value} onChangeText={onChangeText}
-        keyboardType={keyboardType || 'default'} autoCapitalize="characters" />
+    <TouchableOpacity style={styles.outlineBtn} onPress={onPress} activeOpacity={0.7}>
+      <Text style={styles.outlineBtnTxt}>{title}</Text>
+    </TouchableOpacity>
+  );
+}
+
+function SectionHeader({ title, hint }: { title: string; hint?: string }) {
+  return (
+    <View style={styles.sectionHeader}>
+      <Text style={styles.sectionTitle}>{title}</Text>
+      {hint ? <Text style={styles.sectionHint}>{hint}</Text> : null}
     </View>
   );
 }
 
+function FieldLabel({ children }: { children: React.ReactNode }) {
+  return <Text style={styles.fieldLabel}>{children}</Text>;
+}
+
+function InputField({ label, value, onChange, numeric, mono, hint }: {
+  label: string; value: string; onChange: (v: string) => void;
+  numeric?: boolean; mono?: boolean; hint?: string;
+}) {
+  return (
+    <View style={{ marginBottom: 14 }}>
+      <Text style={styles.fieldLabel}>{label}</Text>
+      <TextInput
+        style={[styles.textInput, mono && styles.inputMono]}
+        value={value}
+        onChangeText={onChange}
+        keyboardType={numeric ? 'numeric' : 'default'}
+        autoCapitalize="characters"
+        autoCorrect={false}
+        placeholderTextColor={C.subtext}
+      />
+      {hint ? <Text style={styles.inputHint}>{hint}</Text> : null}
+    </View>
+  );
+}
+
+function EmptyState({ message }: { message: string }) {
+  return (
+    <View style={styles.emptyState}>
+      <Text style={styles.emptyStateTxt}>{message}</Text>
+    </View>
+  );
+}
+
+function Divider() {
+  return <View style={styles.divider} />;
+}
+
+// ─── Styles ───────────────────────────────────────────────────────────────────
+
 const styles = StyleSheet.create({
-  container:      { flex: 1, backgroundColor: '#f0f2f5' },
-  statusBar:      { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: 10 },
-  statusText:     { color: '#fff', fontWeight: '700', fontSize: 13 },
-  disconnectBtn:  { color: '#fff', fontSize: 12, textDecorationLine: 'underline' },
-  tabs:           { flexDirection: 'row', backgroundColor: '#fff', borderBottomWidth: 1, borderColor: '#ddd' },
-  tab:            { flex: 1, alignItems: 'center', paddingVertical: 10 },
-  tabActive:      { borderBottomWidth: 2, borderBottomColor: '#2980b9' },
-  tabText:        { fontSize: 12, color: '#7f8c8d' },
-  tabTextActive:  { color: '#2980b9', fontWeight: '700' },
-  panel:          { flex: 1, padding: 12 },
-  row:            { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 10 },
-  btn:            { paddingHorizontal: 14, paddingVertical: 9, borderRadius: 6, marginRight: 6, marginBottom: 6 },
-  btnText:        { color: '#fff', fontWeight: '600', fontSize: 13 },
-  sectionLabel:   { fontSize: 13, fontWeight: '600', color: '#555', marginVertical: 8 },
-  listItem:       { backgroundColor: '#fff', padding: 12, borderRadius: 8, marginBottom: 6, elevation: 1 },
-  listItemTitle:  { fontSize: 14, fontWeight: '600', color: '#2c3e50' },
-  listItemSub:    { fontSize: 12, color: '#7f8c8d', marginTop: 2 },
-  input:          { borderWidth: 1, borderColor: '#ccc', borderRadius: 6, padding: 8, backgroundColor: '#fff', fontSize: 13 },
-  fieldWrap:      { marginBottom: 10 },
-  fieldLabel:     { fontSize: 12, color: '#555', marginBottom: 4 },
-  chip:           { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 14, borderWidth: 1, borderColor: '#ccc', backgroundColor: '#fff' },
-  chipActive:     { backgroundColor: '#2980b9', borderColor: '#2980b9' },
-  chipText:       { fontSize: 12, color: '#555' },
-  chipTextActive: { color: '#fff', fontWeight: '600' },
-  divider:        { height: 1, backgroundColor: '#ddd', marginVertical: 14 },
+  root:             { flex: 1, backgroundColor: C.bg },
+
+  // Header
+  header:           { flexDirection: 'row', justifyContent: 'space-between',
+                      alignItems: 'center', paddingHorizontal: 16, paddingVertical: 12 },
+  headerTitle:      { color: '#fff', fontWeight: '700', fontSize: 16, letterSpacing: 0.3 },
+  statusRow:        { flexDirection: 'row', alignItems: 'center', marginTop: 2 },
+  dot:              { width: 7, height: 7, borderRadius: 4, marginRight: 5 },
+  headerSub:        { color: 'rgba(255,255,255,0.88)', fontSize: 12 },
+  disconnectBtn:    { paddingHorizontal: 12, paddingVertical: 6,
+                      borderRadius: 6, borderWidth: 1, borderColor: 'rgba(255,255,255,0.6)' },
+  disconnectTxt:    { color: '#fff', fontSize: 12, fontWeight: '600' },
+
+  // Tab bar
+  tabBar:           { flexDirection: 'row', backgroundColor: C.card,
+                      borderBottomWidth: 1, borderColor: C.border },
+  tab:              { flex: 1, alignItems: 'center', paddingVertical: 11 },
+  tabActive:        { borderBottomWidth: 2, borderBottomColor: C.primary },
+  tabLabel:         { fontSize: 12, color: C.subtext },
+
+  // Panel
+  panel:            { flex: 1, padding: 12 },
+  actionRow:        { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap',
+                      marginBottom: 12, gap: 8 },
+
+  // Buttons
+  btn:              { paddingHorizontal: 18, paddingVertical: 10, borderRadius: 8 },
+  btnTxt:           { color: '#fff', fontWeight: '700', fontSize: 13 },
+  outlineBtn:       { paddingHorizontal: 14, paddingVertical: 9, borderRadius: 8,
+                      borderWidth: 1.5, borderColor: C.border, backgroundColor: C.card },
+  outlineBtnTxt:    { color: C.text, fontWeight: '600', fontSize: 13 },
+
+  // Section header
+  sectionHeader:    { flexDirection: 'row', alignItems: 'baseline',
+                      justifyContent: 'space-between', marginBottom: 8 },
+  sectionTitle:     { fontSize: 13, fontWeight: '700', color: C.text },
+  sectionHint:      { fontSize: 11, color: C.subtext },
+
+  // Cards
+  card:             { backgroundColor: C.card, borderRadius: 10, padding: 12,
+                      marginBottom: 8, borderWidth: 1, borderColor: C.border, elevation: 2 },
+  cardActive:       { borderColor: C.primary, borderWidth: 1.5 },
+  cardRow:          { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  cardIcon:         { width: 38, height: 38, borderRadius: 10, backgroundColor: C.primary + '18',
+                      alignItems: 'center', justifyContent: 'center' },
+  cardIconTxt:      { fontSize: 11, fontWeight: '800', color: C.primary },
+  cardIndex:        { width: 28, height: 28, borderRadius: 8,
+                      alignItems: 'center', justifyContent: 'center' },
+  cardIndexTxt:     { fontSize: 12, fontWeight: '700', color: '#fff' },
+  cardTitle:        { fontSize: 14, fontWeight: '600', color: C.text },
+  cardSub:          { fontSize: 11, color: C.subtext, marginTop: 2 },
+
+  // RSSI badge
+  rssiBadge:        { paddingHorizontal: 7, paddingVertical: 3, borderRadius: 6 },
+  rssiBadgeTxt:     { fontSize: 11, fontWeight: '700', color: '#fff' },
+
+  // Fields / inputs
+  fieldLabel:       { fontSize: 12, fontWeight: '600', color: C.subtext, marginBottom: 5 },
+  textInput:        { borderWidth: 1.5, borderColor: C.border, borderRadius: 8,
+                      paddingHorizontal: 12, paddingVertical: 9,
+                      backgroundColor: C.card, fontSize: 13, color: C.text },
+  inputMono:        { fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
+  inputHint:        { fontSize: 11, color: C.subtext, marginTop: 4, marginLeft: 2 },
+
+  // Chip row (memory bank selector)
+  chipRow:          { flexDirection: 'row', marginBottom: 14, gap: 8 },
+  chip:             { paddingHorizontal: 14, paddingVertical: 7, borderRadius: 20,
+                      borderWidth: 1.5, borderColor: C.border, backgroundColor: C.card },
+  chipActive:       { backgroundColor: C.primary, borderColor: C.primary },
+  chipTxt:          { fontSize: 12, fontWeight: '600', color: C.subtext },
+  chipTxtActive:    { color: '#fff' },
+
+  // Misc
+  divider:          { height: 1, backgroundColor: C.border, marginVertical: 18 },
+  emptyState:       { alignItems: 'center', paddingVertical: 48 },
+  emptyStateTxt:    { fontSize: 13, color: C.subtext, textAlign: 'center', lineHeight: 20 },
+  warningBox:       { backgroundColor: '#fce8e6', borderRadius: 10, padding: 14, marginTop: 20,
+                      borderLeftWidth: 3, borderLeftColor: C.danger },
+  warningTitle:     { fontSize: 13, fontWeight: '700', color: C.danger, marginBottom: 4 },
+  warningBody:      { fontSize: 12, color: '#5f2120', lineHeight: 18 },
+  powerReadout:     { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+                      backgroundColor: '#1e8c4512', borderRadius: 8, padding: 12,
+                      borderWidth: 1, borderColor: '#1e8c4540', marginTop: 4 },
+  powerReadoutLabel: { fontSize: 12, color: C.success, fontWeight: '600' },
+  powerReadoutValue: { fontSize: 20, fontWeight: '800', color: C.success },
 });

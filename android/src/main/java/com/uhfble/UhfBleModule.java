@@ -390,6 +390,14 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
     }
 
     @ReactMethod
+    public void getPower(Promise promise) {
+        executor.execute(() -> {
+            try { promise.resolve(uhf.getPower()); }
+            catch (Exception e) { promise.reject("GET_POWER_FAIL", e.getMessage()); }
+        });
+    }
+
+    @ReactMethod
     public void setFrequency(int mode, Promise promise) {
         executor.execute(() -> {
             try { promise.resolve(uhf.setFrequencyMode(mode)); }

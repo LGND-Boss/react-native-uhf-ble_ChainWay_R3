@@ -202,6 +202,14 @@ export function setPower(power: number): Promise<boolean> {
 }
 
 /**
+ * Read the current RF output power from the device.
+ * @returns Current power in dBm as a number.
+ */
+export function getPower(): Promise<number> {
+  return UhfBleNative.getPower();
+}
+
+/**
  * Set the frequency mode/region.
  * 0x08 = FCC (US), other values device-specific.
  */
