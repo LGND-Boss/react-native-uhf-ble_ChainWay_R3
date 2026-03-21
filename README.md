@@ -14,8 +14,9 @@ Supports Android (API 21+) and iOS (CoreBluetooth). Wraps the rscja UHF BLE SDK 
 - Filter inventory by EPC
 - Read / write tag memory banks (RESERVED, EPC, TID, USER)
 - Lock, kill, and erase tags
-- Set reader RF power
+- Set / get reader RF power
 - Set frequency region
+- Single-tag read (one-shot inventory)
 - Full TypeScript types
 
 ---
@@ -28,7 +29,7 @@ npm install react-native-uhf-ble
 
 ### Android
 
-1. Copy `DeviceAPI_ver20220518_release.aar` into `android/app/libs/`
+1. Copy `DeviceAPI_ver20251103_release.aar` into `android/app/libs/`
 2. In `android/app/build.gradle` add:
    ```groovy
    dependencies {
@@ -150,6 +151,14 @@ Same as `startInventory()` but only emits tags whose EPC matches the given strin
 #### `stopInventory(): void`
 Stop the inventory loop.
 
+#### `inventorySingleTag(): Promise<{ rfid_tag: string; rssi: string }>`
+Read the first tag in range and return immediately without starting a continuous session.
+
+```ts
+const tag = await inventorySingleTag();
+console.log(tag.rfid_tag, tag.rssi);
+```
+
 #### `clearData(): Promise<boolean>`
 Reset the internal seen-tag list so the next inventory starts fresh.
 
@@ -254,6 +263,14 @@ Set the RF transmit power in dBm. Typical range: **5–30**.
 
 ```ts
 await setPower(26); // 26 dBm
+```
+
+#### `getPower(): Promise<number>`
+Read the current RF transmit power from the device. Returns the power level in dBm.
+
+```ts
+const power = await getPower();
+console.log(power); // e.g. 26
 ```
 
 #### `setFrequency(mode: number): Promise<boolean>`
