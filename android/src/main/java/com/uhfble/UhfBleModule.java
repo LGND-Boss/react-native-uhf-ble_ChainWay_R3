@@ -46,16 +46,21 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
     private static final String EVENT_SCAN_BLE          = "ScanBLEListener";
     private static final String EVENT_READ_RFID         = "ReadRFIDListener";
     private static final String EVENT_CONNECTION_STATUS = "ConnectionStatusListener";
+    private static final String EVENT_DEBUG             = "UhfDebugListener";
 
     private static final int PERMISSION_REQUEST_CODE = 100;
+    private static final int  INVENTORY_START_RETRIES = 3;
+    private static final long INVENTORY_START_BACKOFF_MS = 120;
+    private static final long INVENTORY_STOP_SETTLE_MS   = 150;
 
     private static ReactApplicationContext reactContext;
     private final RFIDWithUHFBLE uhf = RFIDWithUHFBLE.getInstance();
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
 
-    private volatile boolean isScanning  = false;
-    private volatile boolean isDestroyed = false;
-    private volatile String  filterEpc   = null;
+    private volatile boolean isScanning   = false;
+    private volatile boolean isDestroyed  = false;
+    private volatile boolean debugEnabled = false;
+    private volatile String  filterEpc    = null;
     private String connectedDevice = "";
 
     // Thread-safe sets for deduplication
@@ -89,18 +94,26 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
             @Override
             public void getStatus(ConnectionStatus status, Object device) {
                 WritableMap payload = Arguments.createMap();
+                String stateLabel;
                 if (status == ConnectionStatus.CONNECTED && device instanceof BluetoothDevice) {
                     BluetoothDevice btDevice = (BluetoothDevice) device;
                     connectedDevice = btDevice.getName() + "(" + btDevice.getAddress() + ")";
                     payload.putString("status", "connected");
                     payload.putString("device", connectedDevice);
+                    stateLabel = "connected " + connectedDevice;
                 } else if (status == ConnectionStatus.DISCONNECTED) {
                     connectedDevice = "";
                     payload.putString("status", "disconnected");
+                    stateLabel = "disconnected";
+                    // Reader is gone — any in-flight inventory loop must stop
+                    // so it doesn't keep polling a dead SDK handle.
+                    isScanning = false;
                 } else {
                     payload.putString("status", "connecting");
+                    stateLabel = "connecting";
                 }
                 sendEvent(reactContext, EVENT_CONNECTION_STATUS, payload);
+                debug("ConnectionStatusCallback", stateLabel);
             }
         });
     }
@@ -112,6 +125,32 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
     private void sendEvent(ReactContext context, String eventName, @Nullable WritableMap params) {
         context.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
                .emit(eventName, params);
+    }
+
+    // ─── Debug logging ───────────────────────────────────────────────────────
+    // Always writes to Logcat (visible via `adb logcat -s UhfBleModule`).
+    // When debugEnabled is true (set from JS via setDebugMode(true)) also
+    // emits a structured event to JS so the app can render an in-app console.
+
+    private void debug(String source, String message) {
+        Log.d(TAG, source + " :: " + message);
+        if (!debugEnabled || reactContext == null) return;
+        try {
+            WritableMap payload = Arguments.createMap();
+            payload.putDouble("ts", System.currentTimeMillis());
+            payload.putString("source", source);
+            payload.putString("message", message);
+            sendEvent(reactContext, EVENT_DEBUG, payload);
+        } catch (Exception e) {
+            Log.w(TAG, "debug emit failed: " + e.getMessage());
+        }
+    }
+
+    @ReactMethod
+    public void setDebugMode(boolean enabled, Promise promise) {
+        debugEnabled = enabled;
+        Log.d(TAG, "setDebugMode :: debug events " + (enabled ? "ENABLED" : "disabled"));
+        if (promise != null) promise.resolve(enabled);
     }
 
     // ─── Permission helpers (Android 12+ aware) ──────────────────────────────
@@ -151,13 +190,18 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
 
     @ReactMethod
     public void scanBLE() {
-        if (!checkBlePermissions()) return;
+        if (!checkBlePermissions()) {
+            debug("scanBLE", "blocked: missing BLE permissions");
+            return;
+        }
         seenAddresses.clear();
         BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
         if (adapter == null || !adapter.isEnabled()) {
             Log.w(TAG, "Bluetooth not available or not enabled");
+            debug("scanBLE", "blocked: bluetooth adapter unavailable or disabled");
             return;
         }
+        debug("scanBLE", "starting BLE device scan");
         uhf.startScanBTDevices(new ScanBTCallback() {
             @Override
             public void getDevices(BluetoothDevice device, int rssi, byte[] scanRecord) {
@@ -176,11 +220,13 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
 
     @ReactMethod
     public void stopScanBLE() {
+        debug("stopScanBLE", "stopping BLE device scan");
         uhf.stopScanBTDevices();
     }
 
     @ReactMethod
     public void connectAddress(String address, Promise promise) {
+        debug("connectAddress", "connecting to " + address);
         uhf.connect(address);
         new Handler(Looper.getMainLooper()).postDelayed(() ->
             promise.resolve(connectedDevice.isEmpty() ? address : connectedDevice), 3000);
@@ -188,6 +234,7 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
 
     @ReactMethod
     public void disconnect() {
+        debug("disconnect", "disconnecting current device");
         uhf.disconnect();
     }
 
@@ -202,30 +249,49 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
     // ─── RFID Inventory ──────────────────────────────────────────────────────
 
     @ReactMethod
-    public void startInventory() {
-        if (isScanning) return;
-        filterEpc   = null;
-        isScanning  = true;
-        executor.execute(new InventoryRunnable());
-    }
-
-    @ReactMethod
-    public void startInventoryWithFilter(String epc) {
-        if (isScanning) return;
-        filterEpc  = epc;
+    public synchronized void startInventory() {
+        if (isScanning) {
+            debug("startInventory", "ignored: inventory already running");
+            return;
+        }
+        filterEpc = null;
+        // Reset the per-session dedup set so resuming after a pause shows tags
+        // that were already seen in the previous session.
+        seenEpcs.clear();
         isScanning = true;
+        debug("startInventory", "queued inventory runnable (filter=none)");
         executor.execute(new InventoryRunnable());
     }
 
     @ReactMethod
-    public void stopInventory() {
+    public synchronized void startInventoryWithFilter(String epc) {
+        if (isScanning) {
+            debug("startInventoryWithFilter", "ignored: inventory already running");
+            return;
+        }
+        filterEpc = epc;
+        seenEpcs.clear();
+        isScanning = true;
+        debug("startInventoryWithFilter", "queued runnable, filter=" + epc);
+        executor.execute(new InventoryRunnable());
+    }
+
+    @ReactMethod
+    public synchronized void stopInventory() {
+        if (!isScanning) {
+            debug("stopInventory", "ignored: inventory not running");
+            return;
+        }
         isScanning = false;
+        debug("stopInventory", "isScanning flipped to false; runnable will exit on next tick");
     }
 
     @ReactMethod
     public void clearData(Promise promise) {
         try {
+            int previous = seenEpcs.size();
             seenEpcs.clear();
+            debug("clearData", "cleared " + previous + " cached EPCs");
             promise.resolve(true);
         } catch (Exception e) {
             promise.reject("CLEAR_ERROR", e.getMessage());
@@ -235,10 +301,34 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
     private class InventoryRunnable implements Runnable {
         @Override
         public void run() {
-            if (!uhf.startInventoryTag()) {
+            // Retry the SDK start a few times: when stop+start are called in
+            // rapid succession (e.g. UI pause/resume) the previous stop may
+            // not have fully settled on the reader yet and startInventoryTag()
+            // can return false on the first try.
+            boolean started = false;
+            for (int attempt = 1; attempt <= INVENTORY_START_RETRIES; attempt++) {
+                if (!isScanning) {
+                    debug("InventoryRunnable", "aborted before start: isScanning=false");
+                    return;
+                }
+                if (uhf.startInventoryTag()) {
+                    started = true;
+                    debug("InventoryRunnable", "startInventoryTag ok on attempt " + attempt);
+                    break;
+                }
+                debug("InventoryRunnable",
+                        "startInventoryTag returned false on attempt " + attempt + "/"
+                        + INVENTORY_START_RETRIES);
+                SystemClock.sleep(INVENTORY_START_BACKOFF_MS * attempt);
+            }
+            if (!started) {
                 isScanning = false;
+                debug("InventoryRunnable", "giving up after "
+                        + INVENTORY_START_RETRIES + " failed start attempts");
                 return;
             }
+
+            int emitted = 0;
             while (isScanning) {
                 java.util.List<UHFTAGInfo> list = uhf.readTagFromBufferList();
                 if (list == null || list.isEmpty()) {
@@ -253,17 +343,23 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
                     // Filter by specific EPC if set
                     if (filterEpc != null && !filterEpc.isEmpty() && !filterEpc.equals(epc)) continue;
 
-                    // UNIQUE COUNT: each EPC emitted exactly once per session
-                    // seenEpcs.add() returns false if already present — skip if so
+                    // UNIQUE COUNT: each EPC emitted exactly once per session.
+                    // seenEpcs is reset in startInventory(), so a fresh start
+                    // sees all in-range tags again.
                     if (!seenEpcs.add(epc)) continue;
 
                     WritableMap payload = Arguments.createMap();
                     payload.putString("rfid_tag", epc);
                     payload.putString("rssi",     info.getRssi() != null ? info.getRssi() : "");
                     sendEvent(reactContext, EVENT_READ_RFID, payload);
+                    emitted++;
                 }
             }
             uhf.stopInventory();
+            // Give the reader a moment to settle so the next startInventoryTag()
+            // call doesn't hit the SDK while it's still tearing down.
+            SystemClock.sleep(INVENTORY_STOP_SETTLE_MS);
+            debug("InventoryRunnable", "exited cleanly, unique tags emitted=" + emitted);
         }
     }
 
