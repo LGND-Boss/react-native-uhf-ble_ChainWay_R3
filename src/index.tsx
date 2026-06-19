@@ -20,6 +20,7 @@ const UhfBleNative = NativeModules.UhfBle
 export const SCAN_BLE_EVENT = 'ScanBLEListener';
 export const READ_RFID_EVENT = 'ReadRFIDListener';
 export const CONNECTION_STATUS_EVENT = 'ConnectionStatusListener';
+export const DEBUG_EVENT = 'UhfDebugListener';
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 export interface BLEDevice {
@@ -36,6 +37,12 @@ export interface RFIDTag {
 export interface ConnectionStatus {
   status: 'connected' | 'disconnected' | 'connecting';
   device?: string;
+}
+
+export interface DebugEntry {
+  ts: number;
+  source: string;
+  message: string;
 }
 
 /** bank: 0=RESERVED, 1=EPC, 2=TID, 3=USER */
@@ -215,4 +222,46 @@ export function getPower(): Promise<number> {
  */
 export function setFrequency(mode: number): Promise<boolean> {
   return UhfBleNative.setFrequency(mode);
+}
+
+// ─── Debug ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Enable/disable native debug events. When enabled, the native module emits a
+ * DEBUG_EVENT for every significant state change (scan, connect, inventory
+ * start/stop/retry, errors). Logcat lines are also written either way under
+ * the tag `UhfBleModule` — visible via `adb logcat -s UhfBleModule`.
+ */
+export function setDebugMode(enabled: boolean): Promise<boolean> {
+  return UhfBleNative.setDebugMode(enabled);
+}
+
+/**
+ * Convenience: enables debug mode and pipes every debug entry to `console.log`
+ * (or a custom sink). Returns a cleanup function that detaches the listener
+ * and turns debug mode off.
+ *
+ * Example:
+ * ```ts
+ * useEffect(() => {
+ *   const detach = attachDebugConsole();
+ *   return detach;
+ * }, []);
+ * ```
+ */
+export function attachDebugConsole(
+  sink: (entry: DebugEntry) => void = (e) =>
+    // eslint-disable-next-line no-console
+    console.log(
+      `[UhfBle ${new Date(e.ts).toISOString().slice(11, 23)}] ${e.source} :: ${e.message}`
+    )
+): () => void {
+  const sub = UhfBleEmitter.addListener(DEBUG_EVENT, sink);
+  // Fire-and-forget; if the bridge isn't ready the promise will reject and
+  // we don't want to crash the caller's setup code.
+  UhfBleNative.setDebugMode(true)?.catch?.(() => {});
+  return () => {
+    sub.remove();
+    UhfBleNative.setDebugMode(false)?.catch?.(() => {});
+  };
 }
