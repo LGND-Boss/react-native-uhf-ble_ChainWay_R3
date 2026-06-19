@@ -53,6 +53,15 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
     private static final long INVENTORY_START_BACKOFF_MS = 120;
     private static final long INVENTORY_STOP_SETTLE_MS   = 150;
 
+    // Stall watchdog: if the buffer yields no tags for this long while we still
+    // think we're scanning, re-arm the SDK inventory. The rscja SDK hides the
+    // wire, so "no tags" is ambiguous (could be an empty room) — re-arm is
+    // harmless either way. Only escalate to a full reconnect on a STRONG wedge
+    // signal (startInventoryTag refuses to restart, or the link is no longer
+    // CONNECTED), which never fires just because the room is empty.
+    private static final long INVENTORY_STALL_MS      = 4000;
+    private static final int  INVENTORY_MAX_FAILED_REARMS = 3;
+
     private static ReactApplicationContext reactContext;
     private final RFIDWithUHFBLE uhf = RFIDWithUHFBLE.getInstance();
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
@@ -62,6 +71,8 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
     private volatile boolean debugEnabled = false;
     private volatile String  filterEpc    = null;
     private String connectedDevice = "";
+    // Last address we were asked to connect to — used by the watchdog to reconnect.
+    private volatile String lastAddress = "";
 
     // Thread-safe sets for deduplication
     // Each unique EPC is counted and emitted EXACTLY once per session
@@ -227,6 +238,7 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
     @ReactMethod
     public void connectAddress(String address, Promise promise) {
         debug("connectAddress", "connecting to " + address);
+        lastAddress = address;
         uhf.connect(address);
         new Handler(Looper.getMainLooper()).postDelayed(() ->
             promise.resolve(connectedDevice.isEmpty() ? address : connectedDevice), 3000);
@@ -328,13 +340,49 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
                 return;
             }
 
-            int emitted = 0;
+            int  emitted        = 0;
+            long lastTagMs      = SystemClock.elapsedRealtime();
+            int  failedReArms   = 0;
             while (isScanning) {
+                // A real link drop the connection callback may have missed —
+                // stop spinning a dead handle and let JS reconnect.
+                if (uhf.getConnectStatus() != ConnectionStatus.CONNECTED) {
+                    debug("InventoryRunnable", "link no longer CONNECTED — ending loop");
+                    isScanning = false;
+                    break;
+                }
+
                 java.util.List<UHFTAGInfo> list = uhf.readTagFromBufferList();
                 if (list == null || list.isEmpty()) {
+                    long idle = SystemClock.elapsedRealtime() - lastTagMs;
+                    if (idle >= INVENTORY_STALL_MS) {
+                        // Stall watchdog: re-arm the reader. Harmless in an empty
+                        // room (just restarts RF); recovers a wedged reader.
+                        debug("InventoryRunnable", "stall: no tags for " + idle + "ms — re-arming");
+                        uhf.stopInventory();
+                        SystemClock.sleep(INVENTORY_STOP_SETTLE_MS);
+                        boolean ok = uhf.startInventoryTag();
+                        debug("InventoryRunnable", "re-arm startInventoryTag=" + ok);
+                        lastTagMs = SystemClock.elapsedRealtime();
+                        if (ok) {
+                            failedReArms = 0;
+                        } else {
+                            // SDK refuses to restart → strong wedge signal.
+                            failedReArms++;
+                            if (failedReArms >= INVENTORY_MAX_FAILED_REARMS) {
+                                debug("InventoryRunnable",
+                                        "reader will not restart after " + failedReArms
+                                        + " tries — forcing reconnect");
+                                forceReconnect();
+                                return; // forceReconnect resumes inventory once reconnected
+                            }
+                        }
+                    }
                     SystemClock.sleep(10);
                     continue;
                 }
+                failedReArms = 0;
+                lastTagMs = SystemClock.elapsedRealtime();
                 for (UHFTAGInfo info : list) {
                     if (info == null || info.getEPC() == null) continue;
                     String epc = info.getEPC().trim();
@@ -361,6 +409,34 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
             SystemClock.sleep(INVENTORY_STOP_SETTLE_MS);
             debug("InventoryRunnable", "exited cleanly, unique tags emitted=" + emitted);
         }
+    }
+
+    // Watchdog escalation: the reader is wedged and won't restart in place, so
+    // tear the BLE link down and reconnect — the same recovery a user does by
+    // hand — then resume inventory automatically.
+    private void forceReconnect() {
+        final String addr = lastAddress;
+        isScanning = false;
+        debug("forceReconnect", "addr=" + (addr == null ? "" : addr));
+        try { uhf.disconnect(); } catch (Exception ignored) {}
+        if (addr == null || addr.isEmpty()) {
+            debug("forceReconnect", "no stored address — cannot reconnect");
+            return;
+        }
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            if (isDestroyed) return;
+            debug("forceReconnect", "reconnecting to " + addr);
+            uhf.connect(addr);
+            new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                if (isDestroyed) return;
+                if (uhf.getConnectStatus() == ConnectionStatus.CONNECTED) {
+                    debug("forceReconnect", "reconnected — resuming inventory");
+                    startInventory();
+                } else {
+                    debug("forceReconnect", "reconnect failed (status not connected)");
+                }
+            }, 2000);
+        }, 500);
     }
 
     // ─── Tag Read / Write ────────────────────────────────────────────────────

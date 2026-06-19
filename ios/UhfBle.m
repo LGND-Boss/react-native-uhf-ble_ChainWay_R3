@@ -35,6 +35,14 @@
 #define RESP_SET_POWER       0x11
 #define RESP_SET_REGION      0x2D
 
+// Inventory stall watchdog.
+// We poll the reader every 50ms (GET_LAB_MESSAGE) and it always replies, so
+// complete inbound silence means the reader/link has wedged — the classic
+// "scanning stopped, only a reconnect fixes it". Re-arm a few times, then
+// escalate to a full reconnect-and-resume.
+#define kStallReArmInterval 2.5   // seconds of device silence before re-arming
+#define kStallMaxReArms     4     // re-arms before escalating to a reconnect
+
 typedef NS_ENUM(NSInteger, PendingOperation) {
     OperationNone = 0,
     OperationRead,
@@ -61,6 +69,11 @@ typedef NS_ENUM(NSInteger, PendingOperation) {
 @property (nonatomic, assign) BOOL hasListeners;
 @property (nonatomic, assign) BOOL pendingScan;
 @property (nonatomic, copy)   NSString *filterEpc;
+
+// Stall watchdog state
+@property (nonatomic, assign) NSTimeInterval lastRxTimestamp;            // time of last inbound data
+@property (nonatomic, assign) NSInteger      stallReArmCount;            // consecutive re-arms
+@property (nonatomic, assign) BOOL           resumeInventoryAfterReconnect;
 
 // 50 ms poll timer — fires CMD_GET_LAB_MESSAGE while inventorying
 @property (nonatomic, strong) NSTimer *pollTimer;
@@ -194,6 +207,7 @@ RCT_EXPORT_METHOD(startInventory) {
     self.filterEpc = nil;
     [self.tagBuffer removeAllObjects];
     self.isInventorying = YES;
+    [self resetStallWatchdog];
     [self sendCommand:[self buildStartInventoryCommand]];
     [self startPollTimer];
 }
@@ -203,6 +217,7 @@ RCT_EXPORT_METHOD(startInventoryWithFilter:(NSString *)epc) {
     self.filterEpc = epc;
     [self.tagBuffer removeAllObjects];
     self.isInventorying = YES;
+    [self resetStallWatchdog];
     [self sendCommand:[self buildStartInventoryCommand]];
     [self startPollTimer];
 }
@@ -342,11 +357,19 @@ RCT_EXPORT_METHOD(setFrequency:(int)mode
         // dispatch another async block that would kill the timer we're about to create.
         [self.pollTimer invalidate];
         self.pollTimer = nil;
-        self.pollTimer = [NSTimer scheduledTimerWithTimeInterval:0.05
-                                                          target:self
-                                                        selector:@selector(pollTagData)
-                                                        userInfo:nil
-                                                         repeats:YES];
+        // Schedule on NSRunLoopCommonModes (not the default mode that
+        // +scheduledTimerWithTimeInterval: uses). A default-mode timer is PAUSED
+        // whenever the main run loop enters UITrackingRunLoopMode — i.e. while the
+        // user scrolls/touches the UI. That stops the 50ms drain of the reader's
+        // tag buffer and makes inventory appear to "randomly stop". Common modes
+        // keeps it firing during tracking.
+        NSTimer *t = [NSTimer timerWithTimeInterval:0.05
+                                             target:self
+                                           selector:@selector(pollTagData)
+                                           userInfo:nil
+                                            repeats:YES];
+        self.pollTimer = t;
+        [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
     });
 }
 
@@ -359,13 +382,68 @@ RCT_EXPORT_METHOD(setFrequency:(int)mode
 
 - (void)pollTagData {
     // Called on main thread by NSTimer
-    if (self.isInventorying) {
-        [self sendCommand:[self buildGetLabMessageCommand]];
-    } else {
+    if (!self.isInventorying) {
         // Directly invalidate — we ARE on main thread already
         [self.pollTimer invalidate];
         self.pollTimer = nil;
+        return;
     }
+
+    // ── Stall watchdog ─────────────────────────────────────────────────────────
+    // The reader replies to every GET_LAB_MESSAGE poll, so sustained inbound
+    // silence means it has wedged. Re-arm a few times; if it stays silent,
+    // reconnect and resume. Skipped for single-tag mode, which legitimately
+    // waits (possibly long) for the first tag to enter the field.
+    if (self.pendingOp != OperationSingleInventory) {
+        NSTimeInterval silent = [NSDate timeIntervalSinceReferenceDate] - self.lastRxTimestamp;
+        if (silent > kStallReArmInterval) {
+            self.stallReArmCount++;
+            if (self.stallReArmCount > kStallMaxReArms) {
+                NSLog(@"[UhfBle] WATCHDOG: reader silent %.1fs after %ld re-arms — forcing reconnect",
+                      silent, (long)self.stallReArmCount);
+                [self forceReconnectAndResume];
+                return;
+            }
+            NSLog(@"[UhfBle] WATCHDOG: reader silent %.1fs — re-arming inventory (#%ld)",
+                  silent, (long)self.stallReArmCount);
+            [self sendCommand:[self buildStopInventoryCommand]];
+            [self sendCommand:[self buildStartInventoryCommand]];
+            // Give it a fresh window before counting silence again.
+            self.lastRxTimestamp = [NSDate timeIntervalSinceReferenceDate];
+            return;
+        }
+    }
+
+    // Flow control: don't pile up write-without-response packets when the BLE
+    // TX queue is congested — that backlog itself wedges the command channel.
+    // Skip this tick; the next one (50ms later) retries once the link drains.
+    if (@available(iOS 11.0, *)) {
+        if (!self.usingL2CAP && self.connectedPeripheral &&
+            !self.connectedPeripheral.canSendWriteWithoutResponse) {
+            return;
+        }
+    }
+    [self sendCommand:[self buildGetLabMessageCommand]];
+}
+
+- (void)resetStallWatchdog {
+    self.lastRxTimestamp = [NSDate timeIntervalSinceReferenceDate];
+    self.stallReArmCount = 0;
+}
+
+// Cancel the current connection and immediately reconnect to the same
+// peripheral, resuming inventory once services are rediscovered. This mirrors
+// the manual reconnect that currently "fixes" a wedged reader.
+- (void)forceReconnectAndResume {
+    CBPeripheral *p = self.connectedPeripheral;
+    [self stopPollTimer];
+    self.isInventorying  = NO;   // didDisconnect will also clear; resume flag re-starts it
+    self.stallReArmCount = 0;
+    if (!p) return;
+    self.resumeInventoryAfterReconnect = YES;
+    NSLog(@"[UhfBle] WATCHDOG: cancelling + reconnecting %@", p.identifier.UUIDString);
+    [self.centralManager cancelPeripheralConnection:p];
+    [self.centralManager connectPeripheral:p options:nil];
 }
 
 // ─── CBCentralManagerDelegate ────────────────────────────────────────────────
@@ -480,6 +558,17 @@ didDiscoverCharacteristicsForService:(CBService *)service
         self.connectResolve(name);
         self.connectResolve = nil;
         self.connectReject  = nil;
+    }
+
+    // Watchdog-driven reconnect: services are back, resume inventory where we
+    // left off (tagBuffer is preserved so dedup survives the blip).
+    if (self.writeCharacteristic && self.resumeInventoryAfterReconnect) {
+        self.resumeInventoryAfterReconnect = NO;
+        NSLog(@"[UhfBle] WATCHDOG: reconnected — resuming inventory");
+        self.isInventorying = YES;
+        [self resetStallWatchdog];
+        [self sendCommand:[self buildStartInventoryCommand]];
+        [self startPollTimer];
     }
 }
 
@@ -681,6 +770,9 @@ didOpenL2CAPChannel:(id)channel
 // Parse using LENGTH field — no need to search for terminator
 
 - (void)processReceivedData:(NSData *)incoming {
+    // Any inbound traffic proves the link + reader are alive — feed the watchdog.
+    self.lastRxTimestamp = [NSDate timeIntervalSinceReferenceDate];
+    self.stallReArmCount = 0;
     [self.receiveBuffer appendData:incoming];
 
     while (self.receiveBuffer.length >= 8) { // minimum valid frame size
