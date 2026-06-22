@@ -3,7 +3,7 @@
  * Works on both Android and iOS.
  * Native module (UhfBle) handles BLE + RFID communication.
  */
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import {
   SafeAreaView,
   View,
@@ -34,6 +34,12 @@ export default function App() {
   const [connectedDevice, setDevice]        = useState('');
   const [bleDevices, setBleDevices]         = useState<any[]>([]);
   const [rfidTags, setRfidTags]             = useState<any[]>([]);
+  // Coalesce tag events into one state update per tick (batched flush) and dedup
+  // EPCs via a Set (O(1)). The old per-tag setState + prev.find scan re-rendered
+  // and rescanned the whole list for every tag — O(n²) and janky past a few hundred.
+  const pendingTags = useRef<any[]>([]);
+  const flushTimer  = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const seenTags    = useRef<Set<string>>(new Set());
 
   // Read/Write
   const [rwBank, setRwBank]   = useState('1');
@@ -56,11 +62,24 @@ export default function App() {
       });
     });
     const s2 = emitter.addListener(READ_RFID_EVENT, (tag: any) => {
-      // JS-side dedup as extra safety net (native already deduplicates)
-      setRfidTags(prev => {
-        if (prev.find(t => t.rfid_tag === tag.rfid_tag)) return prev;
-        return [...prev, tag];
-      });
+      // Buffer tags and flush once per tick — one re-render per batch, not per tag.
+      pendingTags.current.push(tag);
+      if (!flushTimer.current) {
+        flushTimer.current = setTimeout(() => {
+          flushTimer.current = null;
+          const batch = pendingTags.current.splice(0);
+          if (!batch.length) return;
+          const fresh: any[] = [];
+          for (const t of batch) {
+            if (!seenTags.current.has(t.rfid_tag)) {
+              seenTags.current.add(t.rfid_tag);
+              fresh.push(t);
+            }
+          }
+          if (!fresh.length) return;
+          setRfidTags(prev => [...prev, ...fresh]);
+        }, 0);
+      }
     });
     const s3 = emitter.addListener(CONNECTION_STATUS_EVENT, (e: any) => {
       setStatus(e.status);
@@ -176,12 +195,21 @@ export default function App() {
             value={filterEpc} onChangeText={setFilterEpc} autoCapitalize="characters" />
           <Row>
             <Btn color="#27ae60" title="Start"
-              onPress={() => filterEpc
-                ? UhfBleNative.startInventoryWithFilter(filterEpc)
-                : UhfBleNative.startInventory()} />
+              onPress={() => {
+                setRfidTags([]);
+                pendingTags.current = [];
+                seenTags.current.clear();
+                filterEpc
+                  ? UhfBleNative.startInventoryWithFilter(filterEpc)
+                  : UhfBleNative.startInventory();
+              }} />
             <Btn color="#e74c3c" title="Stop"  onPress={() => UhfBleNative.stopInventory()} />
             <Btn color="#7f8c8d" title="Clear"
-              onPress={() => UhfBleNative.clearData().then(() => setRfidTags([]))} />
+              onPress={() => UhfBleNative.clearData().then(() => {
+                setRfidTags([]);
+                pendingTags.current = [];
+                seenTags.current.clear();
+              })} />
           </Row>
           <Label>Tags read: {rfidTags.length} (each EPC counted once)</Label>
           <FlatList data={rfidTags} keyExtractor={(_, i) => String(i)}

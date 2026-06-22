@@ -12,3 +12,6 @@ example/ios/Pods/
 *.iml
 .idea/
 local.properties
+
+# Generated iOS test app from ios-setup/setup.sh (not source)
+ios-setup/UhfBleApp/

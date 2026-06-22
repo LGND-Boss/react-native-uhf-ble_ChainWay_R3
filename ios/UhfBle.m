@@ -22,6 +22,7 @@
 #define CMD_LOCK_TAG         0x88
 #define CMD_KILL_TAG         0x8A
 #define CMD_SET_POWER        0x10
+#define CMD_GET_POWER        0x12   // no payload — device returns current power
 #define CMD_SET_REGION       0x2C   // payload: [save=0x01][region_byte]
                                     // region: 0x01=China1 0x02=China2 0x04=EU
                                     //         0x08=FCC/US 0x16=Korea 0x32=Japan
@@ -33,6 +34,7 @@
 #define RESP_LOCK_TAG        0x89
 #define RESP_KILL_TAG        0x8B
 #define RESP_SET_POWER       0x11
+#define RESP_GET_POWER       0x13   // payload: [status][antenna][power*100 BE:2]
 #define RESP_SET_REGION      0x2D
 
 // Inventory stall watchdog.
@@ -52,6 +54,7 @@ typedef NS_ENUM(NSInteger, PendingOperation) {
     OperationKill,
     OperationSingleInventory,
     OperationSetPower,
+    OperationGetPower,
     OperationSetFrequency,
 };
 
@@ -62,7 +65,10 @@ typedef NS_ENUM(NSInteger, PendingOperation) {
 @property (nonatomic, strong) CBCharacteristic *writeCharacteristic;
 @property (nonatomic, strong) NSMutableArray<CBPeripheral *> *discoveredPeripherals;
 @property (nonatomic, strong) NSMutableArray<NSString *> *discoveredAddresses;
-@property (nonatomic, strong) NSMutableArray<NSString *> *tagBuffer;
+// EPC dedup set — O(1) membership test. Was an NSMutableArray + containsObject
+// (O(n) per tag → O(n²) across a session); a set keeps inventory cheap no matter
+// how many unique tags accumulate.
+@property (nonatomic, strong) NSMutableSet<NSString *> *tagBuffer;
 @property (nonatomic, strong) NSMutableData *receiveBuffer;
 
 @property (nonatomic, assign) BOOL isInventorying;
@@ -106,7 +112,7 @@ RCT_EXPORT_MODULE()
     if (self) {
         _discoveredPeripherals = [NSMutableArray array];
         _discoveredAddresses   = [NSMutableArray array];
-        _tagBuffer             = [NSMutableArray array];
+        _tagBuffer             = [NSMutableSet set];
         _receiveBuffer         = [NSMutableData data];
         _isInventorying        = NO;
         _hasListeners          = NO;
@@ -316,6 +322,25 @@ RCT_EXPORT_METHOD(setPower:(int)power
     if (![self assertConnected:reject]) return;
     [self setPendingOp:OperationSetPower resolve:resolve reject:reject];
     [self sendCommand:[self buildSetPowerCommand:power]];
+}
+
+// Read current RF power. Was declared in JS (and present on Android) but never
+// implemented here, so calling getPower() threw. Protocol mirrors the working
+// ObjC sample: send cmd 0x12 (no payload), device replies 0x13 with power*100.
+RCT_EXPORT_METHOD(getPower:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    if (![self assertConnected:reject]) return;
+    [self setPendingOp:OperationGetPower resolve:resolve reject:reject];
+    [self sendCommand:[self buildGetPowerCommand]];
+}
+
+// Debug-mode toggle. The JS layer (attachDebugConsole) calls this; iOS routes
+// verbose logging through NSLog regardless, so accept the flag and resolve so
+// callers don't reject. Kept here so the JS API surface is fully backed.
+RCT_EXPORT_METHOD(setDebugMode:(BOOL)enabled
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    resolve(@(enabled));
 }
 
 // ─── Erase Tag ────────────────────────────────────────────────────────────────
@@ -751,9 +776,17 @@ didOpenL2CAPChannel:(id)channel
     uint16_t powerRaw = (uint16_t)(power * 100);
     uint8_t  powerH   = (powerRaw >> 8) & 0xFF;
     uint8_t  powerL   = powerRaw & 0xFF;
-    uint8_t  bytes[6] = { 0x02, 0x00, powerH, powerL, powerH, powerL };
+    // [mode=0x02][antenna=0x01][readPwr*100 BE][writePwr*100 BE]. Antenna MUST be a
+    // real port (1-based) — the working sample sends antenna "1". Antenna 0x00 is
+    // ack'd by this 4-antenna reader but silently ignored, so power never changed.
+    uint8_t  bytes[6] = { 0x02, 0x01, powerH, powerL, powerH, powerL };
     [payload appendBytes:bytes length:6];
     return [self buildA55AFrame:CMD_SET_POWER data:payload];
+}
+
+- (NSData *)buildGetPowerCommand {
+    // cmd=0x12, no payload
+    return [self buildA55AFrame:CMD_GET_POWER data:nil];
 }
 
 - (NSData *)buildSetFrequencyCommand:(int)mode {
@@ -816,7 +849,7 @@ didOpenL2CAPChannel:(id)channel
 }
 
 - (void)processCmd:(uint8_t)cmd payload:(NSData *)payload {
-    NSLog(@"[UhfBle] cmd=0x%02X payloadLen=%lu", cmd, (unsigned long)payload.length);
+    NSLog(@"[UhfBle] cmd=0x%02X payloadLen=%lu payload=%@", cmd, (unsigned long)payload.length, [self dataToHexString:payload]);
 
     switch (cmd) {
         case RESP_INVENTORY_BATCH:
@@ -828,13 +861,27 @@ didOpenL2CAPChannel:(id)channel
         case RESP_READ_TAG: {
             if (self.pendingOp != OperationRead) break;
             const uint8_t *b = payload.bytes;
-            // payload[0] = status, payload[1..] = data words
-            if (payload.length >= 1 && b[0] == 0x00 && payload.length > 1) {
+            // payload[0] = status (non-zero = success, per device protocol), payload[1..] = data words
+            if (payload.length > 1 && b[0] != 0x00) {
                 NSData *readData = [payload subdataWithRange:NSMakeRange(1, payload.length - 1)];
                 NSString *hex = [self dataToHexString:readData];
                 if (self.pendingResolve) self.pendingResolve(hex);
             } else {
                 if (self.pendingReject) self.pendingReject(@"READ_FAIL", @"Read tag failed", nil);
+            }
+            [self clearPending];
+            break;
+        }
+
+        case RESP_GET_POWER: {
+            if (self.pendingOp != OperationGetPower) break;
+            // payload = [status][antenna][power*100 BE:2][...]; read power lives at [2][3].
+            const uint8_t *b = payload.bytes;
+            if (payload.length >= 4) {
+                int power = (((b[2] & 0xFF) << 8) | (b[3] & 0xFF)) / 100;
+                if (self.pendingResolve) self.pendingResolve(@(power));
+            } else {
+                if (self.pendingReject) self.pendingReject(@"GET_POWER_FAIL", @"Get power failed", nil);
             }
             [self clearPending];
             break;
@@ -847,7 +894,8 @@ didOpenL2CAPChannel:(id)channel
         case RESP_SET_REGION: {
             if (self.pendingOp == OperationNone) break;
             const uint8_t *b = payload.bytes;
-            BOOL ok = (payload.length >= 1 && b[0] == 0x00);
+            // Device status byte: non-zero = success (matches the working ObjC sample).
+            BOOL ok = (payload.length >= 1 && b[0] != 0x00);
             if (ok && self.pendingResolve) self.pendingResolve(@YES);
             else if (!ok && self.pendingReject) self.pendingReject(@"OP_FAIL", @"Operation failed", nil);
             [self clearPending];

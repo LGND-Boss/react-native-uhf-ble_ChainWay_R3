@@ -66,6 +66,10 @@ export default function App() {
   const [isInventorying, setInventory] = useState(false);
   const pendingTags = useRef<RFIDTag[]>([]);
   const flushTimer  = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // O(1) EPC dedup. The old `prev.find(...)` scan ran for every tag — and since
+  // the native layer already dedups, each tag reaching JS scanned the whole list
+  // (O(n²) over a session). A Set keeps the flush cheap as the list grows.
+  const seenTags    = useRef<Set<string>>(new Set());
 
   // R/W
   const [rwBank, setRwBank] = useState('1');
@@ -100,10 +104,15 @@ export default function App() {
           flushTimer.current = null;
           const batch = pendingTags.current.splice(0);
           if (!batch.length) return;
-          setRfidTags(prev => {
-            const fresh = batch.filter(t => !prev.find(p => p.rfid_tag === t.rfid_tag));
-            return fresh.length ? [...prev, ...fresh] : prev;
-          });
+          const fresh: RFIDTag[] = [];
+          for (const t of batch) {
+            if (!seenTags.current.has(t.rfid_tag)) {
+              seenTags.current.add(t.rfid_tag);
+              fresh.push(t);
+            }
+          }
+          if (!fresh.length) return;
+          setRfidTags(prev => [...prev, ...fresh]);
         }, 0);
       }
     });
@@ -141,6 +150,7 @@ export default function App() {
   const handleStartInventory = () => {
     setRfidTags([]);
     pendingTags.current = [];
+    seenTags.current.clear();
     if (flushTimer.current) { clearTimeout(flushTimer.current); flushTimer.current = null; }
     setInventory(true);
     filterEpc ? startInventoryWithFilter(filterEpc) : startInventory();
@@ -152,6 +162,8 @@ export default function App() {
   const handleClearTags = async () => {
     await clearData();
     setRfidTags([]);
+    pendingTags.current = [];
+    seenTags.current.clear();
   };
 
   const handleRead = useCallback(async () => {
