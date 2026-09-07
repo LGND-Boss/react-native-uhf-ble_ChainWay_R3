@@ -86,9 +86,20 @@ typedef NS_ENUM(NSInteger, PendingOperation) {
 
 // L2CAP CoC (iOS 11+, faster than GATT NUS when device supports it)
 @property (nonatomic, strong) id        l2capChannel;       // CBL2CAPChannel*
-@property (nonatomic, strong) NSMutableData *l2capRxBuffer;
 @property (nonatomic, assign) BOOL      usingL2CAP;
 @property (nonatomic, assign) uint16_t  l2capPSM;
+
+// Serial queue all BLE work and frame parsing runs on. GATT callbacks arrive
+// here via the central manager; L2CAP stream data is dispatched here too so
+// receiveBuffer is only ever touched from one queue.
+@property (nonatomic, strong) dispatch_queue_t bleQueue;
+
+// Peripheral with a connect in flight. CoreBluetooth does not retain
+// peripherals for the caller: without a strong reference, a peripheral from
+// retrievePeripheralsWithIdentifiers (or a watchdog reconnect after
+// didDisconnect released connectedPeripheral) deallocates, the connect
+// attempt dies silently, and the connect promise/resume never fires.
+@property (nonatomic, strong) CBPeripheral *pendingPeripheral;
 
 // Pending promise callbacks
 @property (nonatomic, copy) RCTPromiseResolveBlock pendingResolve;
@@ -118,8 +129,8 @@ RCT_EXPORT_MODULE()
         _hasListeners          = NO;
         _pendingScan           = NO;
         _pendingOp             = OperationNone;
-        dispatch_queue_t queue = dispatch_queue_create("com.uhfble.ble", DISPATCH_QUEUE_SERIAL);
-        _centralManager = [[CBCentralManager alloc] initWithDelegate:self queue:queue];
+        _bleQueue = dispatch_queue_create("com.uhfble.ble", DISPATCH_QUEUE_SERIAL);
+        _centralManager = [[CBCentralManager alloc] initWithDelegate:self queue:_bleQueue];
     }
     return self;
 }
@@ -157,6 +168,16 @@ RCT_EXPORT_METHOD(stopScanBLE) {
 RCT_EXPORT_METHOD(connectAddress:(NSString *)address
                   resolver:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject) {
+    // A new connect supersedes any still-pending one — settle the old promise
+    // instead of overwriting its blocks and leaving it hung, and cancel the
+    // old attempt so it can't land as connectedPeripheral later
+    if (self.connectReject) {
+        self.connectReject(@"CONNECT_SUPERSEDED", @"Superseded by a newer connectAddress call", nil);
+    }
+    if (self.pendingPeripheral) {
+        [self.centralManager cancelPeripheralConnection:self.pendingPeripheral];
+        self.pendingPeripheral = nil;
+    }
     self.connectResolve = resolve;
     self.connectReject  = reject;
 
@@ -169,27 +190,44 @@ RCT_EXPORT_METHOD(connectAddress:(NSString *)address
         }
     }
 
-    if (target) {
-        [self.centralManager stopScan];
-        [self.centralManager connectPeripheral:target options:nil];
-    } else {
+    if (!target) {
+        // Not in scan results — fall back to the system's known-peripherals cache
         NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:address];
         if (uuid) {
-            NSArray *known = [self.centralManager retrievePeripheralsWithIdentifiers:@[uuid]];
-            if (known.count > 0) {
-                [self.centralManager connectPeripheral:known[0] options:nil];
-                return;
-            }
+            NSArray<CBPeripheral *> *known =
+                [self.centralManager retrievePeripheralsWithIdentifiers:@[uuid]];
+            if (known.count > 0) target = known[0];
         }
+    }
+
+    if (!target) {
         reject(@"NOT_FOUND", @"Device not found. Run scanBLE first.", nil);
         self.connectResolve = nil;
         self.connectReject  = nil;
+        return;
     }
+
+    self.pendingPeripheral = target; // keep it alive until a delegate callback
+    [self.centralManager stopScan];
+    [self.centralManager connectPeripheral:target options:nil];
+    [self sendEventWithName:EVENT_CONNECTION_STATUS body:@{ @"status": @"connecting" }];
 }
 
 RCT_EXPORT_METHOD(disconnect) {
     if (self.connectedPeripheral) {
         [self.centralManager cancelPeripheralConnection:self.connectedPeripheral];
+    } else if (self.pendingPeripheral) {
+        // Cancel an in-flight connect. Canceling a pending (not yet connected)
+        // peripheral produces no delegate callback, so settle state here.
+        [self.centralManager cancelPeripheralConnection:self.pendingPeripheral];
+        self.pendingPeripheral = nil;
+        self.resumeInventoryAfterReconnect = NO;
+        if (self.connectReject) {
+            self.connectReject(@"CONNECT_CANCELLED", @"Connect cancelled by disconnect()", nil);
+        }
+        self.connectResolve = nil;
+        self.connectReject  = nil;
+        [self sendEventWithName:EVENT_CONNECTION_STATUS body:@{ @"status": @"disconnected" }];
     }
 }
 
@@ -198,8 +236,7 @@ RCT_EXPORT_METHOD(getConnectionStatus:(RCTPromiseResolveBlock)resolve
     if (self.connectedPeripheral &&
         self.connectedPeripheral.state == CBPeripheralStateConnected) {
         resolve(@"connected");
-    } else if (self.connectedPeripheral &&
-               self.connectedPeripheral.state == CBPeripheralStateConnecting) {
+    } else if (self.pendingPeripheral) {
         resolve(@"connecting");
     } else {
         resolve(@"disconnected");
@@ -466,6 +503,9 @@ RCT_EXPORT_METHOD(setFrequency:(int)mode
     self.stallReArmCount = 0;
     if (!p) return;
     self.resumeInventoryAfterReconnect = YES;
+    // didDisconnect releases connectedPeripheral, so hold the peripheral here
+    // or the reconnect attempt can be deallocated out from under us
+    self.pendingPeripheral = p;
     NSLog(@"[UhfBle] WATCHDOG: cancelling + reconnecting %@", p.identifier.UUIDString);
     [self.centralManager cancelPeripheralConnection:p];
     [self.centralManager connectPeripheral:p options:nil];
@@ -507,8 +547,12 @@ RCT_EXPORT_METHOD(setFrequency:(int)mode
 
 - (void)centralManager:(CBCentralManager *)central
   didConnectPeripheral:(CBPeripheral *)peripheral {
-    self.connectedPeripheral = peripheral;
+    self.connectedPeripheral = peripheral; // takes over the strong reference
+    self.pendingPeripheral   = nil;
     peripheral.delegate = self;
+    // Drop any partial frame left over from a previous connection — stale
+    // bytes here desync the parser and turn fresh frames into ghost tags
+    [self.receiveBuffer setLength:0];
     // Discover all services — lets us find L2CAP PSM characteristic if device supports it
     [peripheral discoverServices:nil];
 
@@ -521,6 +565,7 @@ RCT_EXPORT_METHOD(setFrequency:(int)mode
 - (void)centralManager:(CBCentralManager *)central
 didFailToConnectPeripheral:(CBPeripheral *)peripheral
                  error:(NSError *)error {
+    self.pendingPeripheral = nil;
     if (self.connectReject) {
         self.connectReject(@"CONNECT_FAIL", error.localizedDescription ?: @"Connection failed", error);
         self.connectResolve = nil;
@@ -546,6 +591,7 @@ didDisconnectPeripheral:(CBPeripheral *)peripheral
     self.usingL2CAP          = NO;
     self.connectedPeripheral = nil;
     self.writeCharacteristic = nil;
+    [self.receiveBuffer setLength:0];
     [self sendEventWithName:EVENT_CONNECTION_STATUS body:@{ @"status": @"disconnected" }];
 }
 
@@ -635,7 +681,9 @@ didOpenL2CAPChannel:(id)channel
     CBL2CAPChannel *ch = (CBL2CAPChannel *)channel;
     self.l2capChannel   = ch;
     self.usingL2CAP     = YES;
-    self.l2capRxBuffer  = [NSMutableData data];
+    // Transport switches mid-stream: a partial frame received over GATT will
+    // never be completed over L2CAP, so start the parser from a clean buffer
+    [self.receiveBuffer setLength:0];
 
     ch.inputStream.delegate = self;
     [ch.inputStream scheduleInRunLoop:[NSRunLoop mainRunLoop] forMode:NSDefaultRunLoopMode];
@@ -653,7 +701,12 @@ didOpenL2CAPChannel:(id)channel
                 uint8_t buf[512];
                 NSInteger n = [(NSInputStream *)aStream read:buf maxLength:sizeof(buf)];
                 if (n > 0) {
-                    [self processReceivedData:[NSData dataWithBytes:buf length:n]];
+                    // Stream events fire on the main run loop; hop to the BLE
+                    // queue so parsing never races the GATT notify path
+                    NSData *chunk = [NSData dataWithBytes:buf length:n];
+                    dispatch_async(self.bleQueue, ^{
+                        [self processReceivedData:chunk];
+                    });
                 }
                 break;
             }
@@ -800,7 +853,15 @@ didOpenL2CAPChannel:(id)channel
 // ─── Response parser ─────────────────────────────────────────────────────────
 //
 // Device frame format: A5 5A [LEN_H][LEN_L][CMD][data...][XOR_CRC][0D][0A]
-// Parse using LENGTH field — no need to search for terminator
+// A frame is accepted only if its XOR checksum and 0D 0A terminator verify.
+// An A5 5A that fails validation is a false preamble (e.g. inside EPC data
+// after a desync — common right after a watchdog reconnect if stale bytes
+// linger) — drop those two bytes and rescan, so the stream resyncs on the
+// next real frame instead of emitting ghost tags.
+
+// No real reader frame comes close to this; larger declared lengths are
+// false preambles and must not stall the parser waiting for bytes.
+static const NSUInteger kMaxFrameLen = 4096;
 
 - (void)processReceivedData:(NSData *)incoming {
     // Any inbound traffic proves the link + reader are alive — feed the watchdog.
@@ -823,18 +884,24 @@ didOpenL2CAPChannel:(id)channel
             continue;
         }
 
-        // Need LEN field
-        if (self.receiveBuffer.length < 4) break;
-
-        uint16_t totalLen = ((uint16_t)bytes[2] << 8) | bytes[3];
-        if (totalLen < 8) {
-            // Invalid frame length — skip this A5 and retry
+        NSUInteger totalLen = ((NSUInteger)bytes[2] << 8) | bytes[3];
+        if (totalLen < 8 || totalLen > kMaxFrameLen) {
             [self.receiveBuffer replaceBytesInRange:NSMakeRange(0, 2) withBytes:NULL length:0];
             continue;
         }
 
         // Wait until we have the complete frame
         if (self.receiveBuffer.length < totalLen) break;
+
+        // XOR_CRC at [totalLen-3] covers bytes[2..totalLen-4]; trailer is 0D 0A
+        uint8_t xorCrc = 0;
+        for (NSUInteger i = 2; i <= totalLen - 4; i++) xorCrc ^= bytes[i];
+        if (xorCrc != bytes[totalLen - 3] ||
+            bytes[totalLen - 2] != 0x0D || bytes[totalLen - 1] != 0x0A) {
+            NSLog(@"[UhfBle] dropped invalid frame (bad CRC/terminator) — resyncing");
+            [self.receiveBuffer replaceBytesInRange:NSMakeRange(0, 2) withBytes:NULL length:0];
+            continue;
+        }
 
         uint8_t   cmd     = bytes[4];
         NSUInteger dataLen = totalLen - 8; // exclude A5 5A LEN_H LEN_L CMD XOR 0D 0A
