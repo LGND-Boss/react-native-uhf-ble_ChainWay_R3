@@ -32,7 +32,9 @@ import com.rscja.deviceapi.interfaces.KeyEventCallback;
 import com.rscja.deviceapi.interfaces.ScanBTCallback;
 
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -62,6 +64,21 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
     private static final long INVENTORY_STALL_MS      = 4000;
     private static final int  INVENTORY_MAX_FAILED_REARMS = 3;
 
+    // Ghost-read filter. A UHF reader occasionally reports an EPC no real tag
+    // carries: corrupted backscatter that slips past the air-protocol CRC-16,
+    // or a mis-parse inside the vendor SDK when the link resets mid-frame
+    // (the watchdog's stop/start and reconnect cycles are exactly that).
+    // Ghost strings are effectively random and never repeat, while a real tag
+    // in the field is read many times per second — so an EPC is only emitted
+    // after EPC_CONFIRM_READS sightings, and must look like a real Gen2 EPC.
+    private static final int EPC_CONFIRM_READS = 2;
+    private static final int EPC_MIN_HEX_CHARS = 4;    // 2 bytes (1 word)
+    private static final int EPC_MAX_HEX_CHARS = 124;  // 62 bytes, Gen2 max
+
+    // Connect promise: resolve on real CONNECTED status instead of a blind delay
+    private static final long CONNECT_POLL_MS    = 250;
+    private static final long CONNECT_TIMEOUT_MS = 10000;
+
     private static ReactApplicationContext reactContext;
     private final RFIDWithUHFBLE uhf = RFIDWithUHFBLE.getInstance();
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
@@ -78,6 +95,13 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
     // Each unique EPC is counted and emitted EXACTLY once per session
     private final Set<String> seenEpcs      = Collections.synchronizedSet(new HashSet<>());
     private final Set<String> seenAddresses = Collections.synchronizedSet(new HashSet<>());
+    // EPCs seen but not yet confirmed (sighting count below EPC_CONFIRM_READS)
+    private final Map<String, Integer> pendingEpcSightings =
+            Collections.synchronizedMap(new HashMap<>());
+
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private Promise connectPromise;   // main-thread access only
+    private long connectDeadline;
 
     public UhfBleModule(ReactApplicationContext context) {
         super(context);
@@ -235,19 +259,58 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
         uhf.stopScanBTDevices();
     }
 
+    // Polls the SDK's real connection state so the promise reflects the truth.
+    // The old implementation resolved success after a fixed 3 s delay even when
+    // the connection had failed, leaving the app believing it was connected.
+    private final Runnable connectPollRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (connectPromise == null) return;
+            ConnectionStatus s = uhf.getConnectStatus();
+            if (s == ConnectionStatus.CONNECTED) {
+                Promise p = connectPromise;
+                connectPromise = null;
+                debug("connectAddress", "connected: " + connectedDevice);
+                p.resolve(connectedDevice.isEmpty() ? lastAddress : connectedDevice);
+            } else if (SystemClock.elapsedRealtime() >= connectDeadline) {
+                Promise p = connectPromise;
+                connectPromise = null;
+                debug("connectAddress", "timed out waiting for CONNECTED");
+                p.reject("CONNECT_FAIL", "Connection attempt timed out");
+            } else {
+                mainHandler.postDelayed(this, CONNECT_POLL_MS);
+            }
+        }
+    };
+
     @ReactMethod
     public void connectAddress(String address, Promise promise) {
         debug("connectAddress", "connecting to " + address);
         lastAddress = address;
-        uhf.connect(address);
-        new Handler(Looper.getMainLooper()).postDelayed(() ->
-            promise.resolve(connectedDevice.isEmpty() ? address : connectedDevice), 3000);
+        mainHandler.post(() -> {
+            if (connectPromise != null) {
+                connectPromise.reject("CONNECT_SUPERSEDED", "Superseded by a newer connectAddress call");
+                connectPromise = null;
+                mainHandler.removeCallbacks(connectPollRunnable);
+            }
+            connectPromise = promise;
+            connectDeadline = SystemClock.elapsedRealtime() + CONNECT_TIMEOUT_MS;
+            uhf.connect(address);
+            mainHandler.postDelayed(connectPollRunnable, CONNECT_POLL_MS);
+        });
     }
 
     @ReactMethod
     public void disconnect() {
         debug("disconnect", "disconnecting current device");
-        uhf.disconnect();
+        mainHandler.post(() -> {
+            if (connectPromise != null) {
+                connectPromise.reject("CONNECT_CANCELLED", "Connect cancelled by disconnect()");
+                connectPromise = null;
+                mainHandler.removeCallbacks(connectPollRunnable);
+            }
+            uhf.disconnect();
+        });
     }
 
     @ReactMethod
@@ -270,6 +333,7 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
         // Reset the per-session dedup set so resuming after a pause shows tags
         // that were already seen in the previous session.
         seenEpcs.clear();
+        pendingEpcSightings.clear();
         isScanning = true;
         debug("startInventory", "queued inventory runnable (filter=none)");
         executor.execute(new InventoryRunnable());
@@ -283,6 +347,7 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
         }
         filterEpc = epc;
         seenEpcs.clear();
+        pendingEpcSightings.clear();
         isScanning = true;
         debug("startInventoryWithFilter", "queued runnable, filter=" + epc);
         executor.execute(new InventoryRunnable());
@@ -298,11 +363,39 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
         debug("stopInventory", "isScanning flipped to false; runnable will exit on next tick");
     }
 
+    // Read one tag and return it. Declared in the JS API and README but was
+    // missing here, so calling it on Android threw at runtime.
+    @ReactMethod
+    public void inventorySingleTag(Promise promise) {
+        if (uhf.getConnectStatus() != ConnectionStatus.CONNECTED) {
+            promise.reject("NOT_CONNECTED", "No device connected");
+            return;
+        }
+        executor.execute(() -> {
+            try {
+                UHFTAGInfo info = uhf.inventorySingleTag();
+                String epc = (info != null && info.getEPC() != null) ? info.getEPC().trim() : "";
+                if (!epc.isEmpty() && isPlausibleEpc(epc)) {
+                    WritableMap payload = Arguments.createMap();
+                    payload.putString("rfid_tag", epc);
+                    payload.putString("rssi", info.getRssi() != null ? info.getRssi() : "");
+                    debug("inventorySingleTag", "read " + epc);
+                    promise.resolve(payload);
+                } else {
+                    promise.reject("READ_FAIL", "No tag found");
+                }
+            } catch (Exception e) {
+                promise.reject("READ_ERROR", e.getMessage());
+            }
+        });
+    }
+
     @ReactMethod
     public void clearData(Promise promise) {
         try {
             int previous = seenEpcs.size();
             seenEpcs.clear();
+            pendingEpcSightings.clear();
             debug("clearData", "cleared " + previous + " cached EPCs");
             promise.resolve(true);
         } catch (Exception e) {
@@ -390,6 +483,29 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
 
                     // Filter by specific EPC if set
                     if (filterEpc != null && !filterEpc.isEmpty() && !filterEpc.equals(epc)) continue;
+
+                    // Ghost filter stage 1: must look like a real Gen2 EPC
+                    if (!isPlausibleEpc(epc)) {
+                        debug("InventoryRunnable", "rejected implausible EPC: " + epc);
+                        continue;
+                    }
+
+                    if (seenEpcs.contains(epc)) continue;
+
+                    // Ghost filter stage 2: require a second sighting before
+                    // emitting. Real tags are read many times per second;
+                    // ghost EPCs are random one-offs that never repeat.
+                    synchronized (pendingEpcSightings) {
+                        Integer prev = pendingEpcSightings.get(epc);
+                        int sightings = (prev == null ? 0 : prev) + 1;
+                        if (sightings < EPC_CONFIRM_READS) {
+                            pendingEpcSightings.put(epc, sightings);
+                            debug("InventoryRunnable",
+                                    "unconfirmed EPC (" + sightings + "/" + EPC_CONFIRM_READS + "): " + epc);
+                            continue;
+                        }
+                        pendingEpcSightings.remove(epc);
+                    }
 
                     // UNIQUE COUNT: each EPC emitted exactly once per session.
                     // seenEpcs is reset in startInventory(), so a fresh start
@@ -597,5 +713,18 @@ public class UhfBleModule extends ReactContextBaseJavaModule {
 
     private String safePassword(@Nullable String pwd) {
         return (pwd == null || pwd.isEmpty()) ? "00000000" : pwd;
+    }
+
+    // A real Gen2 EPC is an even-length hex string of 2–62 bytes. Anything
+    // else is a corrupted/mis-parsed read and must not reach the app.
+    private static boolean isPlausibleEpc(String epc) {
+        int n = epc.length();
+        if (n < EPC_MIN_HEX_CHARS || n > EPC_MAX_HEX_CHARS || (n & 1) != 0) return false;
+        for (int i = 0; i < n; i++) {
+            char c = epc.charAt(i);
+            boolean hex = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
+            if (!hex) return false;
+        }
+        return true;
     }
 }
